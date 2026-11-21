@@ -24,7 +24,7 @@ struct JXLDropApp: App {
     }
 
     var body: some Scene {
-        WindowGroup("JXL Drop") {
+        Window("JXL Drop", id: "main") {
             ContentView()
                 .frame(minWidth: 520, minHeight: 560)
         }
@@ -51,6 +51,10 @@ struct ContentView: View {
     @AppStorage("jxl.includePhotoshopExtras") private var includePhotoshopExtras = false
 
     private var isBusy: Bool { isProcessing || scansInProgress > 0 }
+    private var colourIsEffectivelyLossless: Bool { !lossy || quality >= 100 }
+    private var transparencyIsEffectivelyLossless: Bool {
+        colourIsEffectivelyLossless || !transparencyLossy || transparencyQuality >= 100
+    }
 
     var body: some View {
         HStack(spacing: 0) {
@@ -169,13 +173,10 @@ struct ContentView: View {
     }
 
     private var compressionSummary: String {
-        let colourMode = lossy && quality < 100 ? "Colour Lossy · \(quality)" : "Colour Lossless"
-        let alphaMode: String
-        if !lossy || quality == 100 || !transparencyLossy || transparencyQuality == 100 {
-            alphaMode = "Transparency Lossless (when present)"
-        } else {
-            alphaMode = "Transparency Lossy · \(transparencyQuality) (when present)"
-        }
+        let colourMode = colourIsEffectivelyLossless ? "Colour Lossless" : "Colour Lossy · \(quality)"
+        let alphaMode = transparencyIsEffectivelyLossless
+            ? "Transparency Lossless (when present)"
+            : "Transparency Lossy · \(transparencyQuality) (when present)"
         let selectedSpeed = SpeedPreset(rawValue: speed) ?? .medium
         return "\(colourMode) · \(alphaMode) · \(selectedSpeed.label)"
     }
@@ -207,10 +208,12 @@ struct ContentView: View {
             ScrollView {
                 VStack(alignment: .leading, spacing: 20) {
                     compressionSection(
-                        title: "Color Compression",
+                        title: "Colour Compression",
                         lossy: $lossy,
                         quality: $quality,
-                        qualityDescription: "Passed directly to cjxl as --quality \(quality). Libjxl quality 100 is mathematically lossless."
+                        qualityDescription: lossy
+                            ? "Passed directly to cjxl as --quality \(quality). Quality 100 is lossless."
+                            : "The colour channel is encoded losslessly."
                     )
 
                     compressionSection(
@@ -220,12 +223,12 @@ struct ContentView: View {
                         qualityDescription: transparencyDescription,
                         isEnabled: lossy && quality < 100
                     )
-                    if !lossy || quality == 100 {
-                        Text("Libjxl's lossless colour path also encodes transparency losslessly.")
+                    if colourIsEffectivelyLossless {
+                        Text("Effective transparency: Lossless. Saved transparency preference (\(transparencyPreferenceSummary)) is retained and resumes when colour is lossy.")
                             .font(.caption)
                             .foregroundStyle(.secondary)
-                    } else if transparencyLossy && transparencyQuality == 100 {
-                        Text("Quality 100 encodes transparency losslessly.")
+                    } else if transparencyIsEffectivelyLossless {
+                        Text("Effective transparency: Lossless at quality 100 or in Lossless mode.")
                             .font(.caption)
                             .foregroundStyle(.secondary)
                     }
@@ -243,7 +246,7 @@ struct ContentView: View {
                         }
                     }
 
-                    Text("Colour quality \(quality) is passed directly to libjxl; 100 is lossless. Transparency quality \(transparencyQuality) uses alpha distance \(String(format: "%.2f", ConversionSettings.alphaDistance(forQuality: transparencyQuality))); 0 is lossless. Adobe's exact mappings are unpublished. Transparency settings apply only to images with alpha.")
+                    Text("Current encoder behaviour: \(compressionSummary). Quality 100 is lossless for colour or transparency. The exact Adobe slider mapping is unpublished; transparency settings apply only to images with alpha.")
                         .font(.caption)
                         .foregroundStyle(.secondary)
                         .fixedSize(horizontal: false, vertical: true)
@@ -256,7 +259,11 @@ struct ContentView: View {
 
     private var transparencyDescription: String {
         let distance = ConversionSettings.alphaDistance(forQuality: transparencyQuality)
-        return "Quality \(transparencyQuality) uses alpha distance \(String(format: "%.2f", distance)); 100 / distance 0 is lossless."
+        return "Saved quality \(transparencyQuality) maps to alpha distance \(String(format: "%.2f", distance)); 100 / distance 0 is lossless."
+    }
+
+    private var transparencyPreferenceSummary: String {
+        transparencyLossy ? "Lossy · \(transparencyQuality)" : "Lossless"
     }
 
     private func compressionSection(title: String, lossy: Binding<Bool>, quality: Binding<Int>, qualityDescription: String, isEnabled: Bool = true) -> some View {
@@ -538,7 +545,7 @@ private enum JXLConverter {
                 guard stagedAlpha == sourceAlpha else {
                     throw ConversionError("The staged image did not preserve the source transparency. The original was kept.")
                 }
-            } else if let stagedAlpha, stagedAlpha.samples.contains(where: { $0 < 255 }) {
+            } else if let stagedAlpha, stagedAlpha.samples.contains(where: { $0 < UInt16.max }) {
                 throw ConversionError("The staged image introduced transparency. The original was kept.")
             }
             encoderInput = staged
@@ -583,10 +590,25 @@ private enum JXLConverter {
                 guard decodedAlpha == sourceAlpha else {
                     throw ConversionError("The lossless alpha setting did not preserve the source transparency. The original was kept.")
                 }
-            } else if sourceAlpha.samples.contains(where: { $0 < 255 }) && !decodedAlpha.samples.contains(where: { $0 < 255 }) {
-                throw ConversionError("The encoded image flattened the source transparency. The original was kept.")
+            } else {
+                let sourceHasTransparentPixels = sourceAlpha.samples.contains(where: { $0 < UInt16.max })
+                let sourceHasVisiblePixels = sourceAlpha.samples.contains(where: { $0 > 0 })
+                let decodedHasTransparentPixels = decodedAlpha.samples.contains(where: { $0 < UInt16.max })
+                let decodedHasVisiblePixels = decodedAlpha.samples.contains(where: { $0 > 0 })
+                if sourceHasTransparentPixels && !decodedHasTransparentPixels {
+                    throw ConversionError("The encoded image flattened the source transparency. The original was kept.")
+                }
+                if !sourceHasTransparentPixels && decodedHasTransparentPixels {
+                    throw ConversionError("The encoded image introduced transparency. The original was kept.")
+                }
+                if sourceHasVisiblePixels && !decodedHasVisiblePixels {
+                    throw ConversionError("The encoded image removed all visible content. The original was kept.")
+                }
+                if !sourceHasVisiblePixels && decodedHasVisiblePixels {
+                    throw ConversionError("The encoded image introduced visible content into a fully transparent source. The original was kept.")
+                }
             }
-        } else if let decodedAlpha, decodedAlpha.samples.contains(where: { $0 != 255 }) {
+        } else if let decodedAlpha, decodedAlpha.samples.contains(where: { $0 != UInt16.max }) {
             throw ConversionError("The encoded image introduced transparency that was not present in the source. The original was kept.")
         }
 
@@ -630,21 +652,29 @@ private enum JXLConverter {
         default:
             return nil
         }
+        guard (1...16).contains(image.bitsPerComponent),
+              !image.bitmapInfo.contains(.floatComponents) else {
+            throw ConversionError("This image's alpha precision cannot be verified without conversion. The original was kept.")
+        }
         let (pixelCount, overflow) = image.width.multipliedReportingOverflow(by: image.height)
-        guard !overflow, pixelCount > 0, pixelCount <= Int.max / 4 else {
+        guard !overflow, pixelCount > 0, pixelCount <= Int.max / 8 else {
             throw ConversionError("This image is too large to verify its transparency safely. The original was kept.")
         }
-        let rowBytes = image.width * 4
-        var rgba = [UInt8](repeating: 0, count: pixelCount * 4)
-        let bitmapInfo = CGBitmapInfo(rawValue: CGImageAlphaInfo.premultipliedLast.rawValue | CGBitmapInfo.byteOrder32Big.rawValue)
-        let context = rgba.withUnsafeMutableBytes { buffer in
-            CGContext(data: buffer.baseAddress, width: image.width, height: image.height, bitsPerComponent: 8, bytesPerRow: rowBytes, space: CGColorSpaceCreateDeviceRGB(), bitmapInfo: bitmapInfo.rawValue)
+        let rowBytes = image.width * 8
+        var rgba = [UInt16](repeating: 0, count: pixelCount * 4)
+        let bitmapInfo = CGBitmapInfo(rawValue: CGImageAlphaInfo.premultipliedLast.rawValue | CGBitmapInfo.byteOrder16Little.rawValue)
+        let drewImage = rgba.withUnsafeMutableBytes { buffer -> Bool in
+            guard let context = CGContext(data: buffer.baseAddress, width: image.width, height: image.height, bitsPerComponent: 16, bytesPerRow: rowBytes, space: CGColorSpaceCreateDeviceRGB(), bitmapInfo: bitmapInfo.rawValue) else {
+                return false
+            }
+            context.setBlendMode(.copy)
+            context.interpolationQuality = .none
+            context.draw(image, in: CGRect(x: 0, y: 0, width: image.width, height: image.height))
+            return true
         }
-        guard let context else {
+        guard drewImage else {
             throw ConversionError("macOS could not inspect this image's transparency. The original was kept.")
         }
-        context.interpolationQuality = .none
-        context.draw(image, in: CGRect(x: 0, y: 0, width: image.width, height: image.height))
         let samples = stride(from: 3, to: rgba.count, by: 4).map { rgba[$0] }
         return AlphaPlane(width: image.width, height: image.height, samples: samples)
     }
@@ -685,7 +715,7 @@ private enum JXLConverter {
 private struct AlphaPlane: Equatable {
     let width: Int
     let height: Int
-    let samples: [UInt8]
+    let samples: [UInt16]
 }
 
 private enum ImageFormats {
@@ -752,8 +782,9 @@ private enum InputDiscovery {
                 for case let url as URL in enumerator { addIfImage(url) }
             } else if values.isRegularFile == true {
                 let before = result.files.count
+                let wasDiscoveredThroughFolder = seen.contains(root.standardizedFileURL.path)
                 addIfImage(root)
-                if result.files.count == before && root.pathExtension.lowercased() != "jxl" {
+                if result.files.count == before && !wasDiscoveredThroughFolder && root.pathExtension.lowercased() != "jxl" {
                     result.issues.append(DiscoveryIssue(name: root.lastPathComponent, message: "Unsupported image format or not a readable image."))
                 }
             } else {

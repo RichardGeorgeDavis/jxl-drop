@@ -10,17 +10,23 @@ struct JXLDropApp: App {
         let defaults = UserDefaults.standard
         let versionKey = "jxl.settingsMigrationVersion"
         if defaults.integer(forKey: versionKey) < 2 {
-            defaults.set(90, forKey: "jxl.quality")
-            defaults.set(true, forKey: "jxl.transparencyLossy")
-            defaults.set(100, forKey: "jxl.transparencyQuality")
+            if defaults.object(forKey: "jxl.quality") == nil { defaults.set(90, forKey: "jxl.quality") }
+            if defaults.object(forKey: "jxl.transparencyLossy") == nil { defaults.set(true, forKey: "jxl.transparencyLossy") }
+            if defaults.object(forKey: "jxl.transparencyQuality") == nil { defaults.set(90, forKey: "jxl.transparencyQuality") }
             defaults.set(2, forKey: versionKey)
+        }
+        if defaults.integer(forKey: versionKey) < 3 {
+            if defaults.object(forKey: "jxl.transparencyLossy") == nil { defaults.set(true, forKey: "jxl.transparencyLossy") }
+            if defaults.object(forKey: "jxl.transparencyQuality") == nil { defaults.set(90, forKey: "jxl.transparencyQuality") }
+            if defaults.object(forKey: "jxl.settingsPanelVisible") == nil { defaults.set(true, forKey: "jxl.settingsPanelVisible") }
+            defaults.set(3, forKey: versionKey)
         }
     }
 
     var body: some Scene {
         WindowGroup("JXL Drop") {
             ContentView()
-                .frame(minWidth: 520, minHeight: 430)
+                .frame(minWidth: 520, minHeight: 560)
         }
         .windowResizability(.contentSize)
     }
@@ -34,11 +40,11 @@ struct ContentView: View {
     @State private var isTargeted = false
     @State private var isProcessing = false
     @State private var scansInProgress = 0
-    @State private var showSettings = false
+    @AppStorage("jxl.settingsPanelVisible") private var settingsPanelVisible = true
     @AppStorage("jxl.lossy") private var lossy = true
     @AppStorage("jxl.quality") private var quality = 90
     @AppStorage("jxl.transparencyLossy") private var transparencyLossy = true
-    @AppStorage("jxl.transparencyQuality") private var transparencyQuality = 100
+    @AppStorage("jxl.transparencyQuality") private var transparencyQuality = 90
     @AppStorage("jxl.speed") private var speed = SpeedPreset.medium.rawValue
     @AppStorage("jxl.includeExif") private var includeExif = false
     @AppStorage("jxl.includeXmp") private var includeXmp = false
@@ -47,11 +53,25 @@ struct ContentView: View {
     private var isBusy: Bool { isProcessing || scansInProgress > 0 }
 
     var body: some View {
+        HStack(spacing: 0) {
+            mainPanel
+                .frame(minWidth: 520, maxWidth: .infinity, maxHeight: .infinity)
+            if settingsPanelVisible {
+                Divider()
+                settingsPanel
+                    .frame(width: 320)
+                    .frame(maxHeight: .infinity, alignment: .top)
+            }
+        }
+        .frame(minWidth: settingsPanelVisible ? 850 : 520, minHeight: 560)
+    }
+
+    private var mainPanel: some View {
         VStack(spacing: 18) {
             HStack {
                 Spacer()
-                Button { showSettings = true } label: {
-                    Label("Settings…", systemImage: "gearshape")
+                Button { settingsPanelVisible.toggle() } label: {
+                    Label(settingsPanelVisible ? "Hide Settings" : "Show Settings", systemImage: "gearshape")
                 }
                 .buttonStyle(.borderless)
             }
@@ -78,7 +98,7 @@ struct ContentView: View {
                         .font(.system(size: 27))
                     Text(isTargeted ? "Release to scan and convert" : "Drop files or folders here")
                         .font(.headline)
-                    Text("Folders are scanned recursively; non-image files are skipped")
+                    Text("Multiple files and folders work; folders are scanned recursively")
                         .font(.caption)
                         .foregroundStyle(.secondary)
                 }
@@ -127,7 +147,7 @@ struct ContentView: View {
             }
 
             HStack {
-                Text("Local processing. Existing .jxl files are never overwritten.")
+                Text("Local processing. Existing .jxl files are ignored.")
                     .font(.caption2)
                     .foregroundStyle(.secondary)
                 Spacer()
@@ -146,13 +166,12 @@ struct ContentView: View {
             }
         }
         .padding(22)
-        .sheet(isPresented: $showSettings) { settingsPanel }
     }
 
     private var compressionSummary: String {
         let colourMode = lossy && quality < 100 ? "Colour Lossy · \(quality)" : "Colour Lossless"
         let alphaMode: String
-        if !lossy || quality == 100 || !transparencyLossy {
+        if !lossy || quality == 100 || !transparencyLossy || transparencyQuality == 100 {
             alphaMode = "Transparency Lossless (when present)"
         } else {
             alphaMode = "Transparency Lossy · \(transparencyQuality) (when present)"
@@ -163,7 +182,7 @@ struct ContentView: View {
 
     private func qualityLabel(_ value: Int) -> String {
         switch value {
-        case 100: "Maximum"
+        case 100: "Lossless"
         case 90...99: "Very High"
         case 75...89: "High"
         case 50...74: "Medium"
@@ -205,6 +224,10 @@ struct ContentView: View {
                         Text("Libjxl's lossless colour path also encodes transparency losslessly.")
                             .font(.caption)
                             .foregroundStyle(.secondary)
+                    } else if transparencyLossy && transparencyQuality == 100 {
+                        Text("Quality 100 encodes transparency losslessly.")
+                            .font(.caption)
+                            .foregroundStyle(.secondary)
                     }
 
                     VStack(alignment: .leading, spacing: 8) {
@@ -220,26 +243,20 @@ struct ContentView: View {
                         }
                     }
 
-                    Text("Color quality \(quality) is passed directly to libjxl. Transparency quality \(transparencyQuality) uses alpha distance \(String(format: "%.2f", ConversionSettings.alphaDistance(forQuality: transparencyQuality))). Adobe's exact mappings are unpublished. Transparency settings apply only to images with alpha.")
+                    Text("Colour quality \(quality) is passed directly to libjxl; 100 is lossless. Transparency quality \(transparencyQuality) uses alpha distance \(String(format: "%.2f", ConversionSettings.alphaDistance(forQuality: transparencyQuality))); 0 is lossless. Adobe's exact mappings are unpublished. Transparency settings apply only to images with alpha.")
                         .font(.caption)
                         .foregroundStyle(.secondary)
                         .fixedSize(horizontal: false, vertical: true)
                 }
             }
 
-            HStack {
-                Spacer()
-                Button("Done") { showSettings = false }
-                    .keyboardShortcut(.defaultAction)
-            }
         }
-        .padding(24)
-        .frame(width: 470, height: 650)
+        .padding(18)
     }
 
     private var transparencyDescription: String {
         let distance = ConversionSettings.alphaDistance(forQuality: transparencyQuality)
-        return "Quality \(transparencyQuality) uses alpha distance \(String(format: "%.2f", distance)); 0 is lossless."
+        return "Quality \(transparencyQuality) uses alpha distance \(String(format: "%.2f", distance)); 100 / distance 0 is lossless."
     }
 
     private func compressionSection(title: String, lossy: Binding<Bool>, quality: Binding<Int>, qualityDescription: String, isEnabled: Bool = true) -> some View {
@@ -438,9 +455,7 @@ private struct ConversionSettings: Sendable {
 
     static func alphaDistance(forQuality quality: Int) -> Double {
         let value = Double(max(0, min(100, quality)))
-        // Keep "Lossy · 100" genuinely lossy. Libjxl distance 0 means
-        // mathematically lossless, so use its smallest positive distance.
-        if value >= 100 { return 0.1 }
+        if value >= 100 { return 0 }
         if value >= 30 { return 0.1 + (100 - value) * 0.09 }
         return (53.0 / 3000.0) * value * value - (23.0 / 20.0) * value + 25.0
     }

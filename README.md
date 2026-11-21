@@ -1,18 +1,20 @@
 # JXL Drop
 
-JXL Drop is a local macOS app for converting images to JPEG XL. Drop files or several folders at once, or choose them in the app. Selected folders are scanned recursively, including nested folders. Hidden files, package contents, unsupported formats and existing `.jxl` files are skipped or reported.
+JXL Drop is a local macOS app for converting images to JPEG XL. Drop several files and folders at once, or choose them in the app. Selected folders are scanned recursively, including nested folders. Hidden files, package contents, unsupported formats and existing `.jxl` files are skipped or reported. Existing JPEG XL files are always ignored.
+
+Discovered images are queued and processed one at a time, so one drop can contain many files and folders without running several encoders concurrently.
 
 For each supported single-frame image, JXL Drop writes a sibling `.jxl`, checks the JPEG XL signature, decodes the result and validates transparency when the source has alpha. It moves the original to macOS Trash only after those checks pass. A failed conversion, changed source, transparency mismatch or output-name collision keeps the original in place. “Clear List” only removes rows from the app.
 
 ## Defaults
 
 - Colour compression: Lossy, quality 90, passed directly to libjxl as `--quality=90`
-- Transparency compression: Lossy, quality 100 / Maximum, matching the supplied Photoshop transparency panel; encoded with libjxl alpha distance 0.1 so the setting remains genuinely lossy
+- Transparency compression: Lossy, quality 90, mapped to libjxl alpha distance 1.0
 - Medium (Good Size), approximated with libjxl effort 6
 - EXIF, XMP and JUMBF metadata excluded
 - Existing `.jxl` files are never overwritten
 
-The colour quality control is passed directly to libjxl, so the default shown and encoded value is 90. Libjxl quality 90 corresponds to distance 1.0; quality 100 maps to distance 0 and is mathematically lossless. Transparency has a separate Lossy/Lossless mode and quality control, as in the supplied Photoshop panel. The app maps transparency quality 90 to alpha distance 1.0, and quality 100 to distance 0.1, the smallest positive distance used here to keep “Lossy · 100” lossy. This is an app-defined mapping based on libjxl’s quality-to-distance curve, not a confirmed mapping to Adobe’s slider. Libjxl’s lossless colour mode also encodes transparency losslessly, so transparency controls are disabled in that mode and when colour quality is 100.
+The main window opens with a settings side panel. On a fresh install, colour quality 90 is passed directly to libjxl and both colour and transparency default to Lossy 90. Existing saved settings are preserved during upgrades. Settings, metadata choices, speed and panel visibility are stored between launches. Libjxl quality 90 corresponds to distance 1.0; quality 100 maps to distance 0 and is mathematically lossless. Transparency has a separate Lossy/Lossless mode and quality control. The app maps transparency quality 90 to alpha distance 1.0 and 100 to distance 0, so 100 encodes alpha losslessly. This is an app-defined mapping based on libjxl’s quality-to-distance curve, not a confirmed mapping to Adobe’s slider. Libjxl’s whole-image lossless colour path also encodes transparency losslessly, so the transparency controls are disabled in that mode and when colour quality is 100.
 
 ## Transparency and input handling
 

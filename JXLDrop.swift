@@ -132,8 +132,8 @@ struct ContentView: View {
                 Label(compressionSummary, systemImage: "slider.horizontal.3")
                 Label(metadataSummary, systemImage: "tag.slash")
                 Label(keepOriginalIfJXLNotSmaller
-                      ? "Original moved to Trash only when JXL is smaller and validated"
-                      : "Original moved to Trash after validation; larger JXLs are allowed",
+                      ? "For new drops: Trash original only when JXL is smaller and validated"
+                      : "For new drops: larger JXLs may replace the original after validation",
                       systemImage: "checkmark.shield")
             }
             .font(.system(size: 12, weight: .medium))
@@ -190,9 +190,7 @@ struct ContentView: View {
             if scansInProgress > 0 {
                 HStack(spacing: 8) {
                     ProgressView().controlSize(.small)
-                    Text(isProcessing
-                         ? "Scanning folders · \(conversionItems.count) images found so far"
-                         : "Scanning folders…")
+                    Text(isProcessing ? "Scanning folders while conversion continues…" : "Scanning folders…")
                         .font(.caption.weight(.medium))
                 }
             } else if isProcessing {
@@ -202,7 +200,7 @@ struct ContentView: View {
                     Text("Converting image \(min(finished + 1, total)) of \(total) · \(finished) complete")
                         .font(.caption.weight(.medium))
                     Spacer()
-                    Text("\(Int((Double(finished) / Double(max(total, 1)) * 100).rounded()))%")
+                    Text("\(Int(Double(finished) / Double(max(total, 1)) * 100))%")
                         .font(.caption.monospacedDigit())
                         .foregroundStyle(.secondary)
                 }
@@ -324,6 +322,9 @@ struct ContentView: View {
 
                     Toggle("Keep original if JXL is not smaller", isOn: $keepOriginalIfJXLNotSmaller)
                     Text("When enabled, the original is kept and no JXL is saved if the validated JXL is the same size or larger. Enabled by default.")
+                        .font(.caption)
+                        .foregroundStyle(.secondary)
+                    Text("Settings are captured when each drop is submitted; changing this toggle affects new drops.")
                         .font(.caption)
                         .foregroundStyle(.secondary)
 
@@ -475,7 +476,7 @@ struct ContentView: View {
                 update(item.id, status: .working, detail: "Preparing image…")
                 do {
                     let result = try await Task.detached(priority: .userInitiated) {
-                        try JXLConverter.convert(item.url, settings: item.settings)
+                        try JXLConverter.convert(item.url, settings: item.settings, queuedSourceVersion: item.queuedSourceVersion)
                     }.value
                     update(item.id, status: result.status, detail: result.message, inputBytes: result.inputBytes, outputBytes: result.outputBytes)
                 } catch {
@@ -523,6 +524,7 @@ private struct ConversionItem: Identifiable {
     let url: URL
     let settings: ConversionSettings
     let batchID: UUID?
+    let queuedSourceVersion: SourceVersion?
     var inputBytes: UInt64?
     var outputBytes: UInt64?
     var status: ItemStatus = .queued
@@ -531,6 +533,7 @@ private struct ConversionItem: Identifiable {
         self.url = url
         self.settings = settings
         self.batchID = batchID
+        self.queuedSourceVersion = try? SourceVersion.capture(url)
         self.status = status
         self.detail = detail
         self.inputBytes = (try? url.resourceValues(forKeys: [.fileSizeKey]).fileSize).map { UInt64(max(0, $0)) }
@@ -622,7 +625,9 @@ private enum ItemStatus: Equatable, Sendable {
 }
 
 private enum JXLConverter {
-    static func convert(_ source: URL, settings: ConversionSettings) throws -> ConversionResult {
+    private static let stripAlphaSupportCache = NSCache<NSString, NSNumber>()
+
+    static func convert(_ source: URL, settings: ConversionSettings, queuedSourceVersion: SourceVersion?) throws -> ConversionResult {
         let source = source.standardizedFileURL
         guard source.isFileURL else { throw ConversionError("This drop is not a local file.") }
         let values = try source.resourceValues(forKeys: [.isRegularFileKey, .isDirectoryKey, .isPackageKey])
@@ -630,7 +635,14 @@ private enum JXLConverter {
         guard values.isPackage != true else { throw ConversionError("Application and document packages are not scanned as image folders.") }
         guard source.pathExtension.lowercased() != "jxl" else { throw ConversionError("This file is already JPEG XL.") }
 
+        guard let queuedSourceVersion else {
+            throw ConversionError("Could not record the image when it was queued. The original was kept.")
+        }
         let sourceVersion = try SourceVersion.capture(source)
+        guard sourceVersion == queuedSourceVersion else {
+            throw ConversionError("The source changed after it was queued. The original was kept; add it again to convert the latest version.")
+        }
+        let sourceDimensions = try readDimensions(source)
         let sourceAlpha = try readAlphaPlane(source)
         let hasTransparentPixels = sourceAlpha?.samples.contains(where: { $0 < UInt16.max }) == true
         let pairedJPEGExists = hasTransparentPixels && Self.hasJPEGPair(for: source)
@@ -677,6 +689,7 @@ private enum JXLConverter {
         }
         if sourceAlpha != nil {
             arguments += ["--ec_resampling=1", "--resampling=1", "--keep_invisible=1"]
+            if Self.supportsStripAlpha(cjxl) { arguments += ["--strip_alpha=0"] }
             if settings.lossy {
                 arguments += ["-a", String(format: "%.4f", locale: Locale(identifier: "en_US_POSIX"), settings.libjxlAlphaDistance)]
             }
@@ -694,6 +707,9 @@ private enum JXLConverter {
         let validation = try run(djxl, [encoded.path, decoded.path])
         guard validation.status == 0, FileManager.default.fileExists(atPath: decoded.path) else {
             throw ConversionError("The new JXL did not pass a decode check. The original was kept. \(validation.message)")
+        }
+        guard try readDimensions(decoded) == sourceDimensions else {
+            throw ConversionError("The encoded image changed the source dimensions. The original was kept.")
         }
         let decodedAlpha = try readAlphaPlane(decoded)
         if let sourceAlpha {
@@ -767,11 +783,11 @@ private enum JXLConverter {
     private static func hasJPEGPair(for source: URL) -> Bool {
         guard source.pathExtension.lowercased() == "png",
               let entries = try? FileManager.default.contentsOfDirectory(atPath: source.deletingLastPathComponent().path) else { return false }
-        let stem = source.deletingPathExtension().lastPathComponent
+        let stem = source.deletingPathExtension().lastPathComponent.lowercased()
         return entries.contains { name in
             let candidate = URL(fileURLWithPath: name)
             return ["jpg", "jpeg"].contains(candidate.pathExtension.lowercased()) &&
-                candidate.deletingPathExtension().lastPathComponent == stem
+                candidate.deletingPathExtension().lastPathComponent.lowercased() == stem
         }
     }
 
@@ -793,10 +809,9 @@ private enum JXLConverter {
                 continue
             }
 
-            // Some synced volumes do not support hard links. O_EXCL still claims
-            // the destination atomically before copying, so an existing file can
-            // never be replaced.
-            let destinationFD = open(candidate.path, O_WRONLY | O_CREAT | O_EXCL, mode_t(0o600))
+            // Copy to a hidden staging file, then atomically publish without replacing.
+            let staging = directory.appendingPathComponent(".jxl-drop-publish-\(UUID().uuidString).tmp")
+            let destinationFD = open(staging.path, O_WRONLY | O_CREAT | O_EXCL, mode_t(0o666))
             if destinationFD < 0 {
                 if errno == EEXIST {
                     suffix += 1
@@ -806,13 +821,22 @@ private enum JXLConverter {
             }
             do {
                 try copyFileContents(from: encoded, to: destinationFD)
-                guard try isJXL(candidate) else {
+                guard try isJXL(staging) else {
                     throw ConversionError("The copied JXL output did not pass its file check. The original was kept.")
+                }
+                guard renameatx_np(AT_FDCWD, staging.path, AT_FDCWD, candidate.path, UInt32(RENAME_EXCL)) == 0 else {
+                    let publishError = errno
+                    _ = unlink(staging.path)
+                    if publishError == EEXIST {
+                        suffix += 1
+                        continue
+                    }
+                    throw ConversionError("Could not safely publish the JXL on this volume; the original was kept. \(String(cString: strerror(publishError)))")
                 }
                 return candidate
             } catch {
                 _ = close(destinationFD)
-                _ = unlink(candidate.path)
+                _ = unlink(staging.path)
                 throw error
             }
         }
@@ -888,12 +912,32 @@ private enum JXLConverter {
         return AlphaPlane(width: image.width, height: image.height, samples: samples)
     }
 
+    private static func readDimensions(_ source: URL) throws -> ImageDimensions {
+        guard let imageSource = CGImageSourceCreateWithURL(source as CFURL, nil),
+              CGImageSourceGetCount(imageSource) == 1,
+              let properties = CGImageSourceCopyPropertiesAtIndex(imageSource, 0, nil) as? [CFString: Any],
+              let width = (properties[kCGImagePropertyPixelWidth] as? NSNumber)?.intValue,
+              let height = (properties[kCGImagePropertyPixelHeight] as? NSNumber)?.intValue,
+              width > 0, height > 0 else {
+            throw ConversionError("macOS could not verify this image's dimensions. The original was kept.")
+        }
+        return ImageDimensions(width: width, height: height)
+    }
+
     private static func findTool(_ name: String) throws -> URL {
         let candidates = ["/opt/homebrew/bin/\(name)", "/usr/local/bin/\(name)"]
         if let path = candidates.first(where: { FileManager.default.isExecutableFile(atPath: $0) }) {
             return URL(fileURLWithPath: path)
         }
         throw ConversionError("JPEG XL tools are missing. Install them in Terminal with: brew install jpeg-xl")
+    }
+
+    private static func supportsStripAlpha(_ cjxl: URL) -> Bool {
+        let key = cjxl.path as NSString
+        if let cached = stripAlphaSupportCache.object(forKey: key) { return cached.boolValue }
+        let supported = ((try? run(cjxl, ["-v", "--help"]))?.message.contains("--strip_alpha")) ?? false
+        stripAlphaSupportCache.setObject(NSNumber(value: supported), forKey: key)
+        return supported
     }
 
     private static func run(_ executable: URL, _ arguments: [String]) throws -> (status: Int32, message: String) {
@@ -925,6 +969,11 @@ private struct AlphaPlane: Equatable {
     let width: Int
     let height: Int
     let samples: [UInt16]
+}
+
+private struct ImageDimensions: Equatable {
+    let width: Int
+    let height: Int
 }
 
 private struct ConversionResult: Sendable {

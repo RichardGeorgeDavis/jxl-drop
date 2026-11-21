@@ -131,7 +131,10 @@ struct ContentView: View {
             VStack(alignment: .leading, spacing: 6) {
                 Label(compressionSummary, systemImage: "slider.horizontal.3")
                 Label(metadataSummary, systemImage: "tag.slash")
-                Label("Original moved to Trash after the JXL is validated", systemImage: "checkmark.shield")
+                Label(keepOriginalIfJXLNotSmaller
+                      ? "Original moved to Trash only when JXL is smaller and validated"
+                      : "Original moved to Trash after validation; larger JXLs are allowed",
+                      systemImage: "checkmark.shield")
             }
             .font(.system(size: 12, weight: .medium))
             .frame(maxWidth: .infinity, alignment: .leading)
@@ -458,7 +461,7 @@ struct ContentView: View {
         for duplicate in urls where !newURLs.contains(where: { $0.standardizedFileURL.path == duplicate.standardizedFileURL.path }) {
             items.insert(ConversionItem(url: duplicate, settings: settings, batchID: batchID, status: .skipped, detail: "Already queued in this batch."), at: 0)
         }
-        let newItems = newURLs.map { ConversionItem(url: $0, settings: settings, keepOriginalIfJXLNotSmaller: keepOriginalIfJXLNotSmaller, batchID: batchID) }
+        let newItems = newURLs.map { ConversionItem(url: $0, settings: settings, batchID: batchID) }
         items.insert(contentsOf: newItems, at: 0)
         pending.append(contentsOf: newItems)
         guard !pending.isEmpty, !isProcessing else {
@@ -472,9 +475,9 @@ struct ContentView: View {
                 update(item.id, status: .working, detail: "Preparing image…")
                 do {
                     let result = try await Task.detached(priority: .userInitiated) {
-                        try JXLConverter.convert(item.url, settings: item.settings, keepOriginalIfJXLNotSmaller: item.keepOriginalIfJXLNotSmaller)
+                        try JXLConverter.convert(item.url, settings: item.settings)
                     }.value
-                    update(item.id, status: result.status, detail: result.message, outputBytes: result.outputBytes)
+                    update(item.id, status: result.status, detail: result.message, inputBytes: result.inputBytes, outputBytes: result.outputBytes)
                 } catch {
                     update(item.id, status: .failed, detail: error.localizedDescription)
                 }
@@ -491,10 +494,11 @@ struct ContentView: View {
         }
     }
 
-    private func update(_ id: UUID, status: ItemStatus, detail: String?, outputBytes: UInt64? = nil) {
+    private func update(_ id: UUID, status: ItemStatus, detail: String?, inputBytes: UInt64? = nil, outputBytes: UInt64? = nil) {
         guard let index = items.firstIndex(where: { $0.id == id }) else { return }
         items[index].status = status
         items[index].detail = detail
+        if let inputBytes { items[index].inputBytes = inputBytes }
         items[index].outputBytes = outputBytes
     }
 
@@ -506,6 +510,7 @@ struct ContentView: View {
             transparencyQuality: transparencyQuality,
             effort: (SpeedPreset(rawValue: speed) ?? .medium).effort,
             fullImageBuffering: fullImageBuffering,
+            keepOriginalIfJXLNotSmaller: keepOriginalIfJXLNotSmaller,
             includeExif: includeExif,
             includeXmp: includeXmp,
             includePhotoshopExtras: includePhotoshopExtras
@@ -518,15 +523,13 @@ private struct ConversionItem: Identifiable {
     let url: URL
     let settings: ConversionSettings
     let batchID: UUID?
-    let inputBytes: UInt64?
-    let keepOriginalIfJXLNotSmaller: Bool
+    var inputBytes: UInt64?
     var outputBytes: UInt64?
     var status: ItemStatus = .queued
     var detail: String? = "Waiting"
-    init(url: URL, settings: ConversionSettings, keepOriginalIfJXLNotSmaller: Bool = true, batchID: UUID? = nil, status: ItemStatus = .queued, detail: String? = "Waiting") {
+    init(url: URL, settings: ConversionSettings, batchID: UUID? = nil, status: ItemStatus = .queued, detail: String? = "Waiting") {
         self.url = url
         self.settings = settings
-        self.keepOriginalIfJXLNotSmaller = keepOriginalIfJXLNotSmaller
         self.batchID = batchID
         self.status = status
         self.detail = detail
@@ -562,6 +565,7 @@ private struct ConversionSettings: Sendable {
     let transparencyQuality: Int
     let effort: Int
     let fullImageBuffering: Bool
+    let keepOriginalIfJXLNotSmaller: Bool
     let includeExif: Bool
     let includeXmp: Bool
     let includePhotoshopExtras: Bool
@@ -618,7 +622,7 @@ private enum ItemStatus: Equatable, Sendable {
 }
 
 private enum JXLConverter {
-    static func convert(_ source: URL, settings: ConversionSettings, keepOriginalIfJXLNotSmaller: Bool) throws -> ConversionResult {
+    static func convert(_ source: URL, settings: ConversionSettings) throws -> ConversionResult {
         let source = source.standardizedFileURL
         guard source.isFileURL else { throw ConversionError("This drop is not a local file.") }
         let values = try source.resourceValues(forKeys: [.isRegularFileKey, .isDirectoryKey, .isPackageKey])
@@ -732,9 +736,10 @@ private enum JXLConverter {
         guard let encodedSize = (encodedAttributes[.size] as? NSNumber)?.uint64Value else {
             throw ConversionError("Could not verify the new JXL size. The original was kept.")
         }
-        if keepOriginalIfJXLNotSmaller && encodedSize >= sourceVersion.size {
+        if settings.keepOriginalIfJXLNotSmaller && encodedSize >= sourceVersion.size {
             return ConversionResult(
                 message: "Kept original; no JXL saved because the validated JXL was the same size or larger.",
+                inputBytes: sourceVersion.size,
                 outputBytes: nil,
                 status: .kept
             )
@@ -756,7 +761,7 @@ private enum JXLConverter {
         } catch {
             throw ConversionError("JXL saved as \(output.lastPathComponent), but the original was kept because macOS could not move it to Trash: \(error.localizedDescription)")
         }
-        return ConversionResult(message: "Saved as \(output.lastPathComponent); original moved to Trash.", outputBytes: outputSize, status: .done)
+        return ConversionResult(message: "Saved as \(output.lastPathComponent); original moved to Trash.", inputBytes: sourceVersion.size, outputBytes: outputSize, status: .done)
     }
 
     private static func hasJPEGPair(for source: URL) -> Bool {
@@ -924,6 +929,7 @@ private struct AlphaPlane: Equatable {
 
 private struct ConversionResult: Sendable {
     let message: String
+    let inputBytes: UInt64
     let outputBytes: UInt64?
     let status: ItemStatus
 }

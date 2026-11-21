@@ -4,7 +4,9 @@ JXL Drop is a local macOS app for converting images to JPEG XL. Drop several fil
 
 Discovered images are queued and processed one at a time in the app's single window, so one drop can contain many files and folders without running several encoders concurrently.
 
-For each supported single-frame image, JXL Drop writes a sibling `.jxl`, checks the JPEG XL signature, decodes the result and validates transparency when the source has alpha. It moves the original to macOS Trash only after those checks pass. A failed conversion, changed source, transparency mismatch or output-name collision keeps the original in place. “Clear List” only removes rows from the app.
+For each supported single-frame image, JXL Drop writes a sibling `.jxl`, checks the JPEG XL signature, decodes the result and validates transparency when the source has alpha. It moves the original to macOS Trash only after those checks pass. If a transparent PNG shares a filename with a JPEG, its output uses `-transparent` before `.jxl` (for example, `cover-transparent.jxl`). Other occupied output names receive `-2`, `-3` and higher suffixes; no existing file is overwritten. A failed conversion, changed source or transparency mismatch keeps the original in place. “Clear List” only removes rows from the app.
+
+The result area shows live file-count progress while converting and a persistent completion summary when the queue is finished. Aggregate size reporting compares only successful replacements in the current drop session, showing their combined source size, combined JXL size and net reduction or growth in MB and as a percentage. Failed or skipped files are excluded from those totals. Earlier result rows remain visible until “Clear List” is used.
 
 ## Defaults
 

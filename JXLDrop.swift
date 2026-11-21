@@ -1,5 +1,6 @@
 import AppKit
 import CoreGraphics
+import Darwin
 import ImageIO
 import SwiftUI
 import UniformTypeIdentifiers
@@ -37,6 +38,8 @@ struct ContentView: View {
     @State private var items: [ConversionItem] = []
     @State private var pending: [ConversionItem] = []
     @State private var queuedPaths = Set<String>()
+    @State private var activeBatchID: UUID?
+    @State private var summaryBatchID: UUID?
     @State private var isTargeted = false
     @State private var isProcessing = false
     @State private var scansInProgress = 0
@@ -55,6 +58,10 @@ struct ContentView: View {
     private var transparencyIsEffectivelyLossless: Bool {
         colourIsEffectivelyLossless || !transparencyLossy || transparencyQuality >= 100
     }
+    private var batchItems: [ConversionItem] { items.filter { $0.batchID == summaryBatchID } }
+    private var conversionItems: [ConversionItem] { batchItems.filter { $0.status != .skipped } }
+    private var finishedItems: [ConversionItem] { conversionItems.filter { $0.status == .done || $0.status == .failed } }
+    private var successfulItems: [ConversionItem] { conversionItems.filter { $0.status == .done && $0.inputBytes != nil && $0.outputBytes != nil } }
 
     var body: some View {
         HStack(spacing: 0) {
@@ -150,19 +157,20 @@ struct ContentView: View {
                 .frame(minHeight: 80, maxHeight: 160)
             }
 
+            if !items.isEmpty || isBusy {
+                batchSummary
+            }
+
             HStack {
                 Text("Local processing. Existing .jxl files are ignored.")
                     .font(.caption2)
                     .foregroundStyle(.secondary)
                 Spacer()
-                if isBusy {
-                    Text(scansInProgress > 0 ? "Scanning…" : "Converting…")
-                        .font(.caption2)
-                        .foregroundStyle(.secondary)
-                    ProgressView().controlSize(.small)
-                }
                 if !items.isEmpty {
-                    Button("Clear List", systemImage: "xmark.circle") { items.removeAll() }
+                    Button("Clear List", systemImage: "xmark.circle") {
+                        items.removeAll()
+                        summaryBatchID = nil
+                    }
                         .buttonStyle(.borderless)
                         .disabled(isBusy)
                         .help("Clear result rows. This does not change any files.")
@@ -170,6 +178,63 @@ struct ContentView: View {
             }
         }
         .padding(22)
+    }
+
+    private var batchSummary: some View {
+        VStack(alignment: .leading, spacing: 6) {
+            if scansInProgress > 0 {
+                HStack(spacing: 8) {
+                    ProgressView().controlSize(.small)
+                    Text(isProcessing
+                         ? "Scanning folders · \(conversionItems.count) images found so far"
+                         : "Scanning folders…")
+                        .font(.caption.weight(.medium))
+                }
+            } else if isProcessing {
+                let total = conversionItems.count
+                let finished = finishedItems.count
+                HStack {
+                    Text("Converting image \(min(finished + 1, total)) of \(total) · \(finished) complete")
+                        .font(.caption.weight(.medium))
+                    Spacer()
+                    Text("\(Int((Double(finished) / Double(max(total, 1)) * 100).rounded()))%")
+                        .font(.caption.monospacedDigit())
+                        .foregroundStyle(.secondary)
+                }
+                ProgressView(value: Double(finished), total: Double(max(total, 1)))
+                    .progressViewStyle(.linear)
+            } else if !conversionItems.isEmpty {
+                let replaced = successfulItems.count
+                let failed = conversionItems.filter { $0.status == .failed }.count
+                Label("Complete · \(replaced) replaced · \(failed) kept", systemImage: "checkmark.circle.fill")
+                    .font(.caption.weight(.medium))
+                    .foregroundStyle(.secondary)
+            } else {
+                Label("No images were converted", systemImage: "info.circle")
+                    .font(.caption.weight(.medium))
+                    .foregroundStyle(.secondary)
+            }
+
+            if !successfulItems.isEmpty {
+                let input = successfulItems.compactMap(\.inputBytes).reduce(UInt64(0), +)
+                let output = successfulItems.compactMap(\.outputBytes).reduce(UInt64(0), +)
+                let delta = input >= output ? input - output : output - input
+                let percentage = input == 0 ? 0 : Double(delta) / Double(input) * 100
+                let percentageText = String(format: "%.1f", percentage)
+                let sizeText = output <= input
+                    ? "saved \(Self.fileSize(delta)) (\(percentageText)%)"
+                    : "JXL is \(Self.fileSize(delta)) larger (\(percentageText)%)"
+                Text("Replaced images: \(Self.fileSize(input)) → \(Self.fileSize(output)) · \(sizeText)")
+                .font(.caption2)
+                .foregroundStyle(.secondary)
+            }
+        }
+        .frame(maxWidth: .infinity, alignment: .leading)
+        .padding(.horizontal, 2)
+    }
+
+    private static func fileSize(_ bytes: UInt64) -> String {
+        ByteCountFormatter.string(fromByteCount: Int64(clamping: bytes), countStyle: .file)
     }
 
     private var compressionSummary: String {
@@ -349,6 +414,11 @@ struct ContentView: View {
 
     private func enqueue(_ urls: [URL], settings: ConversionSettings, providerIssues: [DiscoveryIssue] = []) {
         guard !urls.isEmpty || !providerIssues.isEmpty else { return }
+        if activeBatchID == nil {
+            activeBatchID = UUID()
+            summaryBatchID = activeBatchID
+        }
+        guard let batchID = activeBatchID else { return }
         scansInProgress += 1
         Task {
             let discovery = await Task.detached(priority: .userInitiated) {
@@ -356,51 +426,63 @@ struct ContentView: View {
             }.value
             scansInProgress = max(0, scansInProgress - 1)
             for issue in (providerIssues + discovery.issues).prefix(25) {
-                items.insert(ConversionItem(url: URL(fileURLWithPath: issue.name), settings: settings, status: .skipped, detail: issue.message), at: 0)
+                items.insert(ConversionItem(url: URL(fileURLWithPath: issue.name), settings: settings, batchID: batchID, status: .skipped, detail: issue.message), at: 0)
             }
             guard !discovery.files.isEmpty else {
                 if providerIssues.isEmpty && discovery.issues.isEmpty {
                     let name = urls.first?.lastPathComponent ?? "Selection"
-                    items.insert(ConversionItem(url: URL(fileURLWithPath: name), settings: settings, status: .skipped, detail: "No supported images found. Existing JXL files and non-image files are skipped."), at: 0)
+                    items.insert(ConversionItem(url: URL(fileURLWithPath: name), settings: settings, batchID: batchID, status: .skipped, detail: "No supported images found. Existing JXL files and non-image files are skipped."), at: 0)
                 }
+                closeBatchIfIdle()
                 return
             }
-            enqueueImages(discovery.files, settings: settings)
+            enqueueImages(discovery.files, settings: settings, batchID: batchID)
         }
     }
 
-    private func enqueueImages(_ urls: [URL], settings: ConversionSettings) {
+    private func enqueueImages(_ urls: [URL], settings: ConversionSettings, batchID: UUID) {
         let newURLs = urls.filter { queuedPaths.insert($0.standardizedFileURL.path).inserted }
         for duplicate in urls where !newURLs.contains(where: { $0.standardizedFileURL.path == duplicate.standardizedFileURL.path }) {
-            items.insert(ConversionItem(url: duplicate, settings: settings, status: .skipped, detail: "Already queued in this batch."), at: 0)
+            items.insert(ConversionItem(url: duplicate, settings: settings, batchID: batchID, status: .skipped, detail: "Already queued in this batch."), at: 0)
         }
-        let newItems = newURLs.map { ConversionItem(url: $0, settings: settings) }
+        let newItems = newURLs.map { ConversionItem(url: $0, settings: settings, batchID: batchID) }
         items.insert(contentsOf: newItems, at: 0)
         pending.append(contentsOf: newItems)
-        guard !isProcessing else { return }
+        guard !pending.isEmpty, !isProcessing else {
+            closeBatchIfIdle()
+            return
+        }
         isProcessing = true
         Task {
             while !pending.isEmpty {
                 let item = pending.removeFirst()
                 update(item.id, status: .working, detail: "Preparing image…")
                 do {
-                    let message = try await Task.detached(priority: .userInitiated) {
+                    let result = try await Task.detached(priority: .userInitiated) {
                         try JXLConverter.convert(item.url, settings: item.settings)
                     }.value
-                    update(item.id, status: .done, detail: message)
+                    update(item.id, status: .done, detail: result.message, outputBytes: result.outputBytes)
                 } catch {
                     update(item.id, status: .failed, detail: error.localizedDescription)
                 }
                 queuedPaths.remove(item.url.standardizedFileURL.path)
             }
             isProcessing = false
+            closeBatchIfIdle()
         }
     }
 
-    private func update(_ id: UUID, status: ItemStatus, detail: String?) {
+    private func closeBatchIfIdle() {
+        if scansInProgress == 0 && !isProcessing && pending.isEmpty {
+            activeBatchID = nil
+        }
+    }
+
+    private func update(_ id: UUID, status: ItemStatus, detail: String?, outputBytes: UInt64? = nil) {
         guard let index = items.firstIndex(where: { $0.id == id }) else { return }
         items[index].status = status
         items[index].detail = detail
+        items[index].outputBytes = outputBytes
     }
 
     private var currentSettings: ConversionSettings {
@@ -421,8 +503,19 @@ private struct ConversionItem: Identifiable {
     let id = UUID()
     let url: URL
     let settings: ConversionSettings
+    let batchID: UUID?
+    let inputBytes: UInt64?
+    var outputBytes: UInt64?
     var status: ItemStatus = .queued
     var detail: String? = "Waiting"
+    init(url: URL, settings: ConversionSettings, batchID: UUID? = nil, status: ItemStatus = .queued, detail: String? = "Waiting") {
+        self.url = url
+        self.settings = settings
+        self.batchID = batchID
+        self.status = status
+        self.detail = detail
+        self.inputBytes = (try? url.resourceValues(forKeys: [.fileSizeKey]).fileSize).map { UInt64(max(0, $0)) }
+    }
     var name: String { url.lastPathComponent }
     var symbol: String {
         switch status {
@@ -491,7 +584,7 @@ private enum SpeedPreset: String, CaseIterable, Identifiable {
     }
 }
 
-private enum ItemStatus {
+private enum ItemStatus: Equatable {
     case queued, working, done, failed, skipped
     var label: String {
         switch self {
@@ -505,7 +598,7 @@ private enum ItemStatus {
 }
 
 private enum JXLConverter {
-    static func convert(_ source: URL, settings: ConversionSettings) throws -> String {
+    static func convert(_ source: URL, settings: ConversionSettings) throws -> ConversionResult {
         let source = source.standardizedFileURL
         guard source.isFileURL else { throw ConversionError("This drop is not a local file.") }
         let values = try source.resourceValues(forKeys: [.isRegularFileKey, .isDirectoryKey, .isPackageKey])
@@ -513,12 +606,10 @@ private enum JXLConverter {
         guard values.isPackage != true else { throw ConversionError("Application and document packages are not scanned as image folders.") }
         guard source.pathExtension.lowercased() != "jxl" else { throw ConversionError("This file is already JPEG XL.") }
 
-        let output = source.deletingPathExtension().appendingPathExtension("jxl")
-        guard !FileManager.default.fileExists(atPath: output.path) else {
-            throw ConversionError("A file named \(output.lastPathComponent) already exists. Nothing was changed.")
-        }
         let sourceVersion = try SourceVersion.capture(source)
         let sourceAlpha = try readAlphaPlane(source)
+        let hasTransparentPixels = sourceAlpha?.samples.contains(where: { $0 < UInt16.max }) == true
+        let pairedJPEGExists = hasTransparentPixels && Self.hasJPEGPair(for: source)
 
         let cjxl = try findTool("cjxl")
         let djxl = try findTool("djxl")
@@ -616,10 +707,11 @@ private enum JXLConverter {
             throw ConversionError("The source changed while it was being converted. The original was kept; try again.")
         }
 
-        guard !FileManager.default.fileExists(atPath: output.path) else {
-            throw ConversionError("The output name appeared during conversion. The original was kept.")
+        let output = try Self.publishWithoutOverwrite(encoded, beside: source, preferTransparentName: pairedJPEGExists || (hasTransparentPixels && FileManager.default.fileExists(atPath: source.deletingPathExtension().appendingPathExtension("jxl").path)))
+        let outputAttributes = try FileManager.default.attributesOfItem(atPath: output.path)
+        guard let outputSize = (outputAttributes[.size] as? NSNumber)?.uint64Value else {
+            throw ConversionError("The JXL was saved as \(output.lastPathComponent), but its size could not be verified. The original was kept.")
         }
-        try FileManager.default.moveItem(at: encoded, to: output)
 
         guard try SourceVersion.capture(source) == sourceVersion else {
             throw ConversionError("The source changed during replacement. The JXL was saved as \(output.lastPathComponent), and the source was kept.")
@@ -631,7 +723,86 @@ private enum JXLConverter {
         } catch {
             throw ConversionError("JXL saved as \(output.lastPathComponent), but the original was kept because macOS could not move it to Trash: \(error.localizedDescription)")
         }
-        return "Saved \(output.lastPathComponent); original moved to Trash."
+        return ConversionResult(message: "Saved as \(output.lastPathComponent); original moved to Trash.", outputBytes: outputSize)
+    }
+
+    private static func hasJPEGPair(for source: URL) -> Bool {
+        guard source.pathExtension.lowercased() == "png",
+              let entries = try? FileManager.default.contentsOfDirectory(atPath: source.deletingLastPathComponent().path) else { return false }
+        let stem = source.deletingPathExtension().lastPathComponent
+        return entries.contains { name in
+            let candidate = URL(fileURLWithPath: name)
+            return ["jpg", "jpeg"].contains(candidate.pathExtension.lowercased()) &&
+                candidate.deletingPathExtension().lastPathComponent == stem
+        }
+    }
+
+    private static func publishWithoutOverwrite(_ encoded: URL, beside source: URL, preferTransparentName: Bool) throws -> URL {
+        let directory = source.deletingLastPathComponent()
+        let stem = source.deletingPathExtension().lastPathComponent
+        let primary = preferTransparentName ? "\(stem)-transparent" : stem
+        var suffix = 1
+        while true {
+            let name = suffix == 1 ? primary : "\(primary)-\(suffix)"
+            let candidate = directory.appendingPathComponent(name).appendingPathExtension("jxl")
+            let result = link(encoded.path, candidate.path)
+            if result == 0 {
+                _ = unlink(encoded.path)
+                return candidate
+            }
+            if errno == EEXIST {
+                suffix += 1
+                continue
+            }
+
+            // Some synced volumes do not support hard links. O_EXCL still claims
+            // the destination atomically before copying, so an existing file can
+            // never be replaced.
+            let destinationFD = open(candidate.path, O_WRONLY | O_CREAT | O_EXCL, mode_t(0o600))
+            if destinationFD < 0 {
+                if errno == EEXIST {
+                    suffix += 1
+                    continue
+                }
+                throw ConversionError("Could not create a unique JXL output beside the original: \(String(cString: strerror(errno)))")
+            }
+            do {
+                try copyFileContents(from: encoded, to: destinationFD)
+                guard try isJXL(candidate) else {
+                    throw ConversionError("The copied JXL output did not pass its file check. The original was kept.")
+                }
+                return candidate
+            } catch {
+                _ = close(destinationFD)
+                _ = unlink(candidate.path)
+                throw error
+            }
+        }
+    }
+
+    private static func copyFileContents(from source: URL, to destinationFD: Int32) throws {
+        let input = try FileHandle(forReadingFrom: source)
+        defer { try? input.close() }
+        while let data = try input.read(upToCount: 1024 * 1024), !data.isEmpty {
+            try data.withUnsafeBytes { bytes in
+                guard let base = bytes.baseAddress else { return }
+                var offset = 0
+                while offset < bytes.count {
+                    let written = Darwin.write(destinationFD, base.advanced(by: offset), bytes.count - offset)
+                    if written < 0 {
+                        if errno == EINTR { continue }
+                        throw ConversionError("Could not write the JXL output: \(String(cString: strerror(errno)))")
+                    }
+                    offset += written
+                }
+            }
+        }
+        guard fsync(destinationFD) == 0 else {
+            throw ConversionError("Could not finish writing the JXL output: \(String(cString: strerror(errno)))")
+        }
+        guard close(destinationFD) == 0 else {
+            throw ConversionError("Could not close the JXL output: \(String(cString: strerror(errno)))")
+        }
     }
 
     private static func readAlphaPlane(_ source: URL) throws -> AlphaPlane? {
@@ -716,6 +887,11 @@ private struct AlphaPlane: Equatable {
     let width: Int
     let height: Int
     let samples: [UInt16]
+}
+
+private struct ConversionResult: Sendable {
+    let message: String
+    let outputBytes: UInt64
 }
 
 private enum ImageFormats {

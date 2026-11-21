@@ -150,9 +150,9 @@ struct ContentView: View {
     }
 
     private var compressionSummary: String {
-        let colourMode = lossy ? "Colour Lossy · \(quality)" : "Colour Lossless"
+        let colourMode = lossy && quality < 100 ? "Colour Lossy · \(quality)" : "Colour Lossless"
         let alphaMode: String
-        if !lossy || quality == 100 || !transparencyLossy || transparencyQuality == 100 {
+        if !lossy || quality == 100 || !transparencyLossy {
             alphaMode = "Transparency Lossless (when present)"
         } else {
             alphaMode = "Transparency Lossy · \(transparencyQuality) (when present)"
@@ -438,7 +438,9 @@ private struct ConversionSettings: Sendable {
 
     static func alphaDistance(forQuality quality: Int) -> Double {
         let value = Double(max(0, min(100, quality)))
-        if value >= 100 { return 0 }
+        // Keep "Lossy · 100" genuinely lossy. Libjxl distance 0 means
+        // mathematically lossless, so use its smallest positive distance.
+        if value >= 100 { return 0.1 }
         if value >= 30 { return 0.1 + (100 - value) * 0.09 }
         return (53.0 / 3000.0) * value * value - (23.0 / 20.0) * value + 25.0
     }

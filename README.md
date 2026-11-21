@@ -7,12 +7,12 @@ For each supported single-frame image, JXL Drop writes a sibling `.jxl`, checks 
 ## Defaults
 
 - Colour compression: Lossy, quality 90, passed directly to libjxl as `--quality=90`
-- Transparency compression: Lossy, quality 100 / Maximum, matching the supplied Photoshop transparency panel; libjxl alpha distance 0 is mathematically lossless
+- Transparency compression: Lossy, quality 100 / Maximum, matching the supplied Photoshop transparency panel; encoded with libjxl alpha distance 0.1 so the setting remains genuinely lossy
 - Medium (Good Size), approximated with libjxl effort 6
 - EXIF, XMP and JUMBF metadata excluded
 - Existing `.jxl` files are never overwritten
 
-Libjxl quality 90 corresponds to distance 1.0; quality 100 maps to distance 0 and is mathematically lossless. The colour quality control is passed directly to libjxl. The separate transparency control uses libjxl’s quality-to-distance curve for `--alpha_distance`; it is not a known mapping to Adobe’s slider. Thus transparency quality 90 maps to alpha distance 1.0, while 100 maps to 0 (mathematically lossless). Both controls can be changed independently when the colour mode is lossy. Libjxl’s lossless colour mode also encodes transparency losslessly, so the transparency controls are disabled in that mode and when colour quality is 100.
+The colour quality control is passed directly to libjxl, so the default shown and encoded value is 90. Libjxl quality 90 corresponds to distance 1.0; quality 100 maps to distance 0 and is mathematically lossless. Transparency has a separate Lossy/Lossless mode and quality control, as in the supplied Photoshop panel. The app maps transparency quality 90 to alpha distance 1.0, and quality 100 to distance 0.1, the smallest positive distance used here to keep “Lossy · 100” lossy. This is an app-defined mapping based on libjxl’s quality-to-distance curve, not a confirmed mapping to Adobe’s slider. Libjxl’s lossless colour mode also encodes transparency losslessly, so transparency controls are disabled in that mode and when colour quality is 100.
 
 ## Transparency and input handling
 

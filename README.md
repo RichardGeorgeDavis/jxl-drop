@@ -12,11 +12,14 @@ The result area shows live file-count progress while converting and a persistent
 
 - Colour compression: Lossy, quality 90, passed directly to libjxl as `--quality=90`
 - Transparency compression: Lossy, quality 90, mapped to libjxl alpha distance 1.0
-- Medium (Good Size), approximated with libjxl effort 6
+- Medium (Good Size), mapped to libjxl effort 6
+- Automatic libjxl buffering; full-image buffering is an optional setting and may use more memory for better compression
 - EXIF, XMP and JUMBF metadata excluded
 - Existing `.jxl` files are always ignored
 
-The main window opens with a settings side panel. On a fresh install, colour quality 90 is passed directly to libjxl and both colour and transparency default to Lossy 90. Existing saved settings are preserved during upgrades. Settings, metadata choices, speed and panel visibility are stored between launches. Libjxl quality 90 corresponds to distance 1.0; quality 100 maps to distance 0 and is mathematically lossless. Transparency has a separate Lossy/Lossless mode and quality control. The app maps transparency quality 90 to alpha distance 1.0 and 100 to distance 0, so 100 encodes alpha losslessly. This is an app-defined mapping based on libjxl’s quality-to-distance curve, not a confirmed mapping to Adobe’s slider. Libjxl’s whole-image lossless colour path also encodes transparency losslessly, so the transparency controls are disabled in that mode and when colour quality is 100.
+The main window opens with a settings side panel. On a fresh install, colour quality 90 is passed directly to libjxl and both colour and transparency default to Lossy 90. Existing saved settings are preserved during upgrades. Settings, metadata choices, speed, buffering and panel visibility are stored between launches. Libjxl quality 90 corresponds to distance 1.0; quality 100 maps to distance 0 and is mathematically lossless. Transparency has a separate Lossy/Lossless mode and quality control. The app maps transparency quality 90 to alpha distance 1.0 and 100 to distance 0, so 100 encodes alpha losslessly. This is an app-defined mapping based on libjxl’s quality-to-distance curve, not a confirmed mapping to Adobe’s slider. Libjxl’s whole-image lossless colour path also encodes transparency losslessly, so the transparency controls are disabled in that mode and when colour quality is 100.
+
+The Speed picker sets libjxl effort to 1, 3, 6, 8 or 10. Higher effort takes longer and may improve compression at the selected quality, but does not guarantee a smaller file for every image. “Use full image buffering” passes `--buffering=0`; it can improve compression while using more memory. It is off by default, leaving buffering to libjxl.
 
 ## Transparency and input handling
 

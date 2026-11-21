@@ -49,6 +49,7 @@ struct ContentView: View {
     @AppStorage("jxl.transparencyLossy") private var transparencyLossy = true
     @AppStorage("jxl.transparencyQuality") private var transparencyQuality = 90
     @AppStorage("jxl.speed") private var speed = SpeedPreset.medium.rawValue
+    @AppStorage("jxl.fullImageBuffering") private var fullImageBuffering = false
     @AppStorage("jxl.includeExif") private var includeExif = false
     @AppStorage("jxl.includeXmp") private var includeXmp = false
     @AppStorage("jxl.includePhotoshopExtras") private var includePhotoshopExtras = false
@@ -243,7 +244,8 @@ struct ContentView: View {
             ? "Transparency Lossless (when present)"
             : "Transparency Lossy · \(transparencyQuality) (when present)"
         let selectedSpeed = SpeedPreset(rawValue: speed) ?? .medium
-        return "\(colourMode) · \(alphaMode) · \(selectedSpeed.label)"
+        let buffering = fullImageBuffering ? "Full image buffer" : "Automatic buffer"
+        return "\(colourMode) · \(alphaMode) · \(selectedSpeed.label) · \(buffering)"
     }
 
     private func qualityLabel(_ value: Int) -> String {
@@ -310,6 +312,11 @@ struct ContentView: View {
                             Text(preset.label).tag(preset.rawValue)
                         }
                     }
+
+                    Toggle("Use full image buffering", isOn: $fullImageBuffering)
+                    Text("Passes --buffering=0 to cjxl. Uses more memory and may improve compression.")
+                        .font(.caption)
+                        .foregroundStyle(.secondary)
 
                     Text("Current encoder behaviour: \(compressionSummary). Quality 100 is lossless for colour or transparency. The exact Adobe slider mapping is unpublished; transparency settings apply only to images with alpha.")
                         .font(.caption)
@@ -492,6 +499,7 @@ struct ContentView: View {
             transparencyLossy: transparencyLossy && lossy && quality < 100,
             transparencyQuality: transparencyQuality,
             effort: (SpeedPreset(rawValue: speed) ?? .medium).effort,
+            fullImageBuffering: fullImageBuffering,
             includeExif: includeExif,
             includeXmp: includeXmp,
             includePhotoshopExtras: includePhotoshopExtras
@@ -543,6 +551,7 @@ private struct ConversionSettings: Sendable {
     let transparencyLossy: Bool
     let transparencyQuality: Int
     let effort: Int
+    let fullImageBuffering: Bool
     let includeExif: Bool
     let includeXmp: Bool
     let includePhotoshopExtras: Bool
@@ -566,11 +575,11 @@ private enum SpeedPreset: String, CaseIterable, Identifiable {
     var id: String { rawValue }
     var label: String {
         switch self {
-        case .fastest: "Fastest (Largest)"
-        case .fast: "Fast (Larger)"
+        case .fastest: "Fastest (Effort 1)"
+        case .fast: "Fast (Effort 3)"
         case .medium: "Medium (Good Size)"
-        case .slow: "Slow (Smaller)"
-        case .slowest: "Slowest (Smallest)"
+        case .slow: "Slow (Effort 8)"
+        case .slowest: "Slowest (Effort 10)"
         }
     }
     var effort: Int {
@@ -645,6 +654,7 @@ private enum JXLConverter {
         let encoded = source.deletingLastPathComponent().appendingPathComponent(".jxl-drop-\(UUID().uuidString).jxl")
         defer { try? FileManager.default.removeItem(at: encoded) }
         var arguments = ["--quiet", "-e", String(settings.effort)]
+        if settings.fullImageBuffering { arguments += ["--buffering=0"] }
         if settings.lossy {
             arguments += ["-j", "0", "-q", String(settings.libjxlQuality)]
         } else {

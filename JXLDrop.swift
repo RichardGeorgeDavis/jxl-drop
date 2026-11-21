@@ -6,6 +6,17 @@ import UniformTypeIdentifiers
 
 @main
 struct JXLDropApp: App {
+    init() {
+        let defaults = UserDefaults.standard
+        let versionKey = "jxl.settingsMigrationVersion"
+        if defaults.integer(forKey: versionKey) < 2 {
+            defaults.set(90, forKey: "jxl.quality")
+            defaults.set(true, forKey: "jxl.transparencyLossy")
+            defaults.set(100, forKey: "jxl.transparencyQuality")
+            defaults.set(2, forKey: versionKey)
+        }
+    }
+
     var body: some Scene {
         WindowGroup("JXL Drop") {
             ContentView()
@@ -25,7 +36,9 @@ struct ContentView: View {
     @State private var scansInProgress = 0
     @State private var showSettings = false
     @AppStorage("jxl.lossy") private var lossy = true
-    @AppStorage("jxl.quality") private var quality = 100
+    @AppStorage("jxl.quality") private var quality = 90
+    @AppStorage("jxl.transparencyLossy") private var transparencyLossy = true
+    @AppStorage("jxl.transparencyQuality") private var transparencyQuality = 100
     @AppStorage("jxl.speed") private var speed = SpeedPreset.medium.rawValue
     @AppStorage("jxl.includeExif") private var includeExif = false
     @AppStorage("jxl.includeXmp") private var includeXmp = false
@@ -137,13 +150,19 @@ struct ContentView: View {
     }
 
     private var compressionSummary: String {
-        let mode = lossy ? "Lossy · \(quality) / \(qualityLabel)" : "Lossless"
+        let colourMode = lossy ? "Colour Lossy · \(quality)" : "Colour Lossless"
+        let alphaMode: String
+        if !lossy || quality == 100 || !transparencyLossy || transparencyQuality == 100 {
+            alphaMode = "Transparency Lossless (when present)"
+        } else {
+            alphaMode = "Transparency Lossy · \(transparencyQuality) (when present)"
+        }
         let selectedSpeed = SpeedPreset(rawValue: speed) ?? .medium
-        return "\(mode) · \(selectedSpeed.label)"
+        return "\(colourMode) · \(alphaMode) · \(selectedSpeed.label)"
     }
 
-    private var qualityLabel: String {
-        switch quality {
+    private func qualityLabel(_ value: Int) -> String {
+        switch value {
         case 100: "Maximum"
         case 90...99: "Very High"
         case 75...89: "High"
@@ -166,55 +185,47 @@ struct ContentView: View {
             Text("JPEG XL Settings")
                 .font(.title2.weight(.semibold))
 
-            VStack(alignment: .leading, spacing: 10) {
-                Text("Color Compression").font(.headline)
-                Picker("Mode", selection: $lossy) {
-                    Text("Lossy").tag(true)
-                    Text("Lossless").tag(false)
-                }
-                .pickerStyle(.segmented)
+            ScrollView {
+                VStack(alignment: .leading, spacing: 20) {
+                    compressionSection(
+                        title: "Color Compression",
+                        lossy: $lossy,
+                        quality: $quality,
+                        qualityDescription: "Passed directly to cjxl as --quality \(quality). Libjxl quality 100 is mathematically lossless."
+                    )
 
-                if lossy {
-                    HStack {
-                        Text("Quality")
-                        Spacer()
-                        TextField("Quality", value: Binding(
-                            get: { quality },
-                            set: { quality = min(100, max(1, $0)) }
-                        ), format: .number)
-                            .frame(width: 54)
-                            .multilineTextAlignment(.trailing)
-                        Text(qualityLabel)
+                    compressionSection(
+                        title: "Transparency Compression",
+                        lossy: $transparencyLossy,
+                        quality: $transparencyQuality,
+                        qualityDescription: transparencyDescription,
+                        isEnabled: lossy && quality < 100
+                    )
+                    if !lossy || quality == 100 {
+                        Text("Libjxl's lossless colour path also encodes transparency losslessly.")
+                            .font(.caption)
                             .foregroundStyle(.secondary)
-                            .frame(width: 82, alignment: .leading)
                     }
-                    Slider(value: Binding(
-                        get: { Double(quality) },
-                        set: { quality = Int($0.rounded()) }
-                    ), in: 1...100, step: 1)
-                    Text("Quality \(quality) maps to libjxl quality \(ConversionSettings.mapQuality(quality)); the Adobe scale is unpublished.")
+
+                    VStack(alignment: .leading, spacing: 8) {
+                        Text("Metadata").font(.headline)
+                        Toggle("Include EXIF Metadata", isOn: $includeExif)
+                        Toggle("Include XMP Metadata", isOn: $includeXmp)
+                        Toggle("Include Photoshop Extras (JUMBF)", isOn: $includePhotoshopExtras)
+                    }
+
+                    Picker("Speed", selection: $speed) {
+                        ForEach(SpeedPreset.allCases) { preset in
+                            Text(preset.label).tag(preset.rawValue)
+                        }
+                    }
+
+                    Text("Color quality \(quality) is passed directly to libjxl. Transparency quality \(transparencyQuality) uses alpha distance \(String(format: "%.2f", ConversionSettings.alphaDistance(forQuality: transparencyQuality))). Adobe's exact mappings are unpublished. Transparency settings apply only to images with alpha.")
                         .font(.caption)
                         .foregroundStyle(.secondary)
+                        .fixedSize(horizontal: false, vertical: true)
                 }
             }
-
-            Picker("Speed", selection: $speed) {
-                ForEach(SpeedPreset.allCases) { preset in
-                    Text(preset.label).tag(preset.rawValue)
-                }
-            }
-
-            VStack(alignment: .leading, spacing: 8) {
-                Text("Metadata").font(.headline)
-                Toggle("Include EXIF Metadata", isOn: $includeExif)
-                Toggle("Include XMP Metadata", isOn: $includeXmp)
-                Toggle("Include Photoshop Extras (JUMBF)", isOn: $includePhotoshopExtras)
-            }
-
-            Text("Defaults match the supplied Photoshop screenshot. Quality and speed mappings are approximations. EXIF and XMP metadata are controlled here; the Photoshop extras option controls JUMBF metadata. Embedded colour information is retained where supported.")
-                .font(.caption)
-                .foregroundStyle(.secondary)
-                .fixedSize(horizontal: false, vertical: true)
 
             HStack {
                 Spacer()
@@ -223,7 +234,49 @@ struct ContentView: View {
             }
         }
         .padding(24)
-        .frame(width: 430)
+        .frame(width: 470, height: 650)
+    }
+
+    private var transparencyDescription: String {
+        let distance = ConversionSettings.alphaDistance(forQuality: transparencyQuality)
+        return "Quality \(transparencyQuality) uses alpha distance \(String(format: "%.2f", distance)); 0 is lossless."
+    }
+
+    private func compressionSection(title: String, lossy: Binding<Bool>, quality: Binding<Int>, qualityDescription: String, isEnabled: Bool = true) -> some View {
+        VStack(alignment: .leading, spacing: 9) {
+            Text(title).font(.headline)
+            Picker("Mode", selection: lossy) {
+                Text("Lossy").tag(true)
+                Text("Lossless").tag(false)
+            }
+            .pickerStyle(.segmented)
+            .disabled(!isEnabled)
+
+            if lossy.wrappedValue {
+                HStack {
+                    Text("Quality")
+                    Spacer()
+                    TextField("Quality", value: Binding(
+                        get: { quality.wrappedValue },
+                        set: { quality.wrappedValue = min(100, max(1, $0)) }
+                    ), format: .number)
+                        .frame(width: 54)
+                        .multilineTextAlignment(.trailing)
+                        .disabled(!isEnabled)
+                    Text(qualityLabel(quality.wrappedValue))
+                        .foregroundStyle(.secondary)
+                        .frame(width: 82, alignment: .leading)
+                }
+                Slider(value: Binding(
+                    get: { Double(quality.wrappedValue) },
+                    set: { quality.wrappedValue = Int($0.rounded()) }
+                ), in: 1...100, step: 1)
+                .disabled(!isEnabled)
+                Text(qualityDescription)
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+            }
+        }
     }
 
     private func acceptDrop(_ providers: [NSItemProvider]) -> Bool {
@@ -330,6 +383,8 @@ struct ContentView: View {
         ConversionSettings(
             lossy: lossy,
             quality: quality,
+            transparencyLossy: transparencyLossy && lossy && quality < 100,
+            transparencyQuality: transparencyQuality,
             effort: (SpeedPreset(rawValue: speed) ?? .medium).effort,
             includeExif: includeExif,
             includeXmp: includeXmp,
@@ -368,15 +423,24 @@ private struct ConversionItem: Identifiable {
 private struct ConversionSettings: Sendable {
     let lossy: Bool
     let quality: Int
+    let transparencyLossy: Bool
+    let transparencyQuality: Int
     let effort: Int
     let includeExif: Bool
     let includeXmp: Bool
     let includePhotoshopExtras: Bool
 
-    var libjxlQuality: Int { Self.mapQuality(quality) }
+    var libjxlQuality: Int { max(1, min(100, quality)) }
 
-    static func mapQuality(_ quality: Int) -> Int {
-        max(1, min(95, Int((Double(quality) * 0.95).rounded())))
+    var libjxlAlphaDistance: Double {
+        transparencyLossy ? Self.alphaDistance(forQuality: transparencyQuality) : 0
+    }
+
+    static func alphaDistance(forQuality quality: Int) -> Double {
+        let value = Double(max(0, min(100, quality)))
+        if value >= 100 { return 0 }
+        if value >= 30 { return 0.1 + (100 - value) * 0.09 }
+        return (53.0 / 3000.0) * value * value - (23.0 / 20.0) * value + 25.0
     }
 }
 
@@ -452,8 +516,13 @@ private enum JXLConverter {
             guard result.status == 0, FileManager.default.fileExists(atPath: staged.path) else {
                 throw ConversionError("macOS could not read this image format. \(result.message)")
             }
-            guard try readAlphaPlane(staged) == sourceAlpha else {
-                throw ConversionError("The staged image did not preserve the source transparency. The original was kept.")
+            let stagedAlpha = try readAlphaPlane(staged)
+            if let sourceAlpha {
+                guard stagedAlpha == sourceAlpha else {
+                    throw ConversionError("The staged image did not preserve the source transparency. The original was kept.")
+                }
+            } else if let stagedAlpha, stagedAlpha.samples.contains(where: { $0 < 255 }) {
+                throw ConversionError("The staged image introduced transparency. The original was kept.")
             }
             encoderInput = staged
         }
@@ -467,8 +536,10 @@ private enum JXLConverter {
             arguments += ["-j", "0", "-d", "0"]
         }
         if sourceAlpha != nil {
-            // Keep alpha at full resolution and mathematically lossless, even at low color quality.
-            arguments += ["-a", "0", "--ec_resampling=1", "--resampling=1", "--keep_invisible=1"]
+            arguments += ["--ec_resampling=1", "--resampling=1", "--keep_invisible=1"]
+            if settings.lossy {
+                arguments += ["-a", String(format: "%.4f", locale: Locale(identifier: "en_US_POSIX"), settings.libjxlAlphaDistance)]
+            }
         }
         if !settings.includeExif { arguments += ["-x", "strip=exif"] }
         if !settings.includeXmp { arguments += ["-x", "strip=xmp"] }
@@ -486,8 +557,17 @@ private enum JXLConverter {
         }
         let decodedAlpha = try readAlphaPlane(decoded)
         if let sourceAlpha {
-            guard decodedAlpha == sourceAlpha else {
-                throw ConversionError("The encoded image did not preserve the source transparency. The original was kept.")
+            guard let decodedAlpha,
+                  decodedAlpha.width == sourceAlpha.width,
+                  decodedAlpha.height == sourceAlpha.height else {
+                throw ConversionError("The encoded image lost the source transparency channel or changed its dimensions. The original was kept.")
+            }
+            if settings.libjxlAlphaDistance == 0 {
+                guard decodedAlpha == sourceAlpha else {
+                    throw ConversionError("The lossless alpha setting did not preserve the source transparency. The original was kept.")
+                }
+            } else if sourceAlpha.samples.contains(where: { $0 < 255 }) && !decodedAlpha.samples.contains(where: { $0 < 255 }) {
+                throw ConversionError("The encoded image flattened the source transparency. The original was kept.")
             }
         } else if let decodedAlpha, decodedAlpha.samples.contains(where: { $0 != 255 }) {
             throw ConversionError("The encoded image introduced transparency that was not present in the source. The original was kept.")

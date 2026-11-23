@@ -22,6 +22,71 @@
 	<string>2</string>
 	<key>LSMinimumSystemVersion</key>
 	<string>13.0</string>
+	<key>CFBundleDocumentTypes</key>
+	<array>
+		<dict>
+			<key>CFBundleTypeName</key>
+			<string>Image folder</string>
+			<key>CFBundleTypeRole</key>
+			<string>Viewer</string>
+			<key>LSHandlerRank</key>
+			<string>Alternate</string>
+			<key>LSItemContentTypes</key>
+			<array>
+				<string>public.folder</string>
+			</array>
+		</dict>
+		<dict>
+			<key>CFBundleTypeName</key>
+			<string>Convertible image</string>
+			<key>CFBundleTypeRole</key>
+			<string>Viewer</string>
+			<key>LSHandlerRank</key>
+			<string>Alternate</string>
+			<key>LSItemContentTypes</key>
+			<array>
+				<string>public.jpeg</string>
+				<string>public.png</string>
+				<string>com.compuserve.gif</string>
+				<string>com.ilm.openexr-image</string>
+				<string>public.ppm</string>
+				<string>public.pnm</string>
+				<string>public.pgm</string>
+				<string>public.pam</string>
+				<string>public.pfm</string>
+				<string>public.pgx</string>
+				<string>public.heic</string>
+				<string>public.heif</string>
+				<string>public.tiff</string>
+				<string>com.microsoft.bmp</string>
+				<string>org.webmproject.webp</string>
+				<string>public.jpeg-2000</string>
+			</array>
+			<key>CFBundleTypeExtensions</key>
+			<array>
+				<string>jpg</string>
+				<string>jpeg</string>
+				<string>png</string>
+				<string>gif</string>
+				<string>apng</string>
+				<string>exr</string>
+				<string>ppm</string>
+				<string>pnm</string>
+				<string>pgm</string>
+				<string>pam</string>
+				<string>pfm</string>
+				<string>pgx</string>
+				<string>heic</string>
+				<string>heif</string>
+				<string>tif</string>
+				<string>tiff</string>
+				<string>bmp</string>
+				<string>webp</string>
+				<string>jp2</string>
+				<string>j2k</string>
+			</array>
+		</dict>
+	</array>
 	<key>NSHighResolutionCapable</key>
 	<true/>
 	<key>NSSupportsAutomaticGraphicsSwitching</key>

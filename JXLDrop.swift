@@ -1,4 +1,5 @@
 import AppKit
+import Combine
 import CoreGraphics
 import Darwin
 import ImageIO
@@ -7,6 +8,9 @@ import UniformTypeIdentifiers
 
 @main
 struct JXLDropApp: App {
+    @NSApplicationDelegateAdaptor(AppDelegate.self) private var appDelegate
+    @StateObject private var dropInbox = DropInbox()
+
     init() {
         let defaults = UserDefaults.standard
         let versionKey = "jxl.settingsMigrationVersion"
@@ -26,23 +30,78 @@ struct JXLDropApp: App {
 
     var body: some Scene {
         Window("JXL Drop", id: "main") {
-            ContentView()
+            ContentView(dropInbox: dropInbox)
                 .frame(minWidth: 520, minHeight: 560)
+                .onAppear { appDelegate.attach(dropInbox) }
         }
         .windowResizability(.contentSize)
     }
 }
 
 @MainActor
+private final class DropInbox: ObservableObject {
+    @Published private(set) var requests: [DropRequest] = []
+
+    func enqueue(_ urls: [URL]) {
+        guard !urls.isEmpty else { return }
+        requests.append(DropRequest(urls: urls))
+    }
+
+    func removeAll() { requests.removeAll() }
+}
+
+private struct DropRequest: Identifiable {
+    let id = UUID()
+    let urls: [URL]
+}
+
+@MainActor
+private final class AppDelegate: NSObject, NSApplicationDelegate {
+    private weak var inbox: DropInbox?
+    private var pendingURLs: [URL] = []
+
+    func attach(_ inbox: DropInbox) {
+        self.inbox = inbox
+        inbox.enqueue(pendingURLs)
+        pendingURLs.removeAll()
+    }
+
+    func application(_ application: NSApplication, openFiles filenames: [String]) {
+        let urls = filenames.map { URL(fileURLWithPath: $0) }
+        if let inbox {
+            inbox.enqueue(urls)
+        } else {
+            pendingURLs.append(contentsOf: urls)
+        }
+        application.reply(toOpenOrPrint: .success)
+    }
+}
+
+@MainActor
 struct ContentView: View {
+    @ObservedObject fileprivate var dropInbox: DropInbox
     @State private var items: [ConversionItem] = []
     @State private var pending: [ConversionItem] = []
-    @State private var queuedPaths = Set<String>()
+    @State private var knownPaths = Set<String>()
+    @State private var itemIndexByID: [UUID: Int] = [:]
+    @State private var itemIndexByPath: [String: Int] = [:]
+    @State private var orderedItemIDs: [UUID] = []
+    @State private var sortGeneration = 0
     @State private var activeBatchID: UUID?
     @State private var summaryBatchID: UUID?
     @State private var isTargeted = false
-    @State private var isProcessing = false
+    @State private var activeConversionCount = 0
+    @State private var nextPendingIndex = 0
+    @State private var batchConcurrencyLimit = 1
     @State private var scansInProgress = 0
+    @State private var summaryTotal = 0
+    @State private var summaryFinished = 0
+    @State private var summaryReplaced = 0
+    @State private var processedItemCount = 0
+    @State private var summaryInputBytes: UInt64 = 0
+    @State private var summaryOutputBytes: UInt64 = 0
+    @AppStorage("jxl.dashboardSort") private var dashboardSort = DashboardSort.name.rawValue
+    @AppStorage("jxl.maxConcurrentConversions") private var maxConcurrentConversions = 1
     @AppStorage("jxl.settingsPanelVisible") private var settingsPanelVisible = true
     @AppStorage("jxl.lossy") private var lossy = true
     @AppStorage("jxl.quality") private var quality = 90
@@ -55,15 +114,12 @@ struct ContentView: View {
     @AppStorage("jxl.includeXmp") private var includeXmp = false
     @AppStorage("jxl.includePhotoshopExtras") private var includePhotoshopExtras = false
 
+    private var isProcessing: Bool { activeConversionCount > 0 || nextPendingIndex < pending.count }
     private var isBusy: Bool { isProcessing || scansInProgress > 0 }
     private var colourIsEffectivelyLossless: Bool { !lossy || quality >= 100 }
     private var transparencyIsEffectivelyLossless: Bool {
         colourIsEffectivelyLossless || !transparencyLossy || transparencyQuality >= 100
     }
-    private var batchItems: [ConversionItem] { items.filter { $0.batchID == summaryBatchID } }
-    private var conversionItems: [ConversionItem] { batchItems.filter { $0.status != .skipped } }
-    private var finishedItems: [ConversionItem] { conversionItems.filter { $0.status == .done || $0.status == .failed || $0.status == .kept } }
-    private var successfulItems: [ConversionItem] { conversionItems.filter { $0.status == .done && $0.inputBytes != nil && $0.outputBytes != nil } }
 
     var body: some View {
         HStack(spacing: 0) {
@@ -77,6 +133,11 @@ struct ContentView: View {
             }
         }
         .frame(minWidth: settingsPanelVisible ? 850 : 520, minHeight: 560)
+        .contentShape(Rectangle())
+        .onDrop(of: [UTType.fileURL.identifier], isTargeted: $isTargeted, perform: acceptDrop)
+        .onChange(of: dashboardSort) { _ in sortVisibleItems() }
+        .onChange(of: dropInbox.requests.count) { _ in consumeAppIconDrops() }
+        .onAppear { consumeAppIconDrops() }
     }
 
     private var mainPanel: some View {
@@ -118,7 +179,6 @@ struct ContentView: View {
                 .foregroundStyle(isTargeted ? Color.accentColor : Color.secondary)
             }
             .frame(height: 132)
-            .onDrop(of: [UTType.fileURL.identifier], isTargeted: $isTargeted, perform: acceptDrop)
 
             HStack {
                 Spacer()
@@ -140,23 +200,47 @@ struct ContentView: View {
             .frame(maxWidth: .infinity, alignment: .leading)
 
             if !items.isEmpty {
-                List(items) { item in
-                    HStack(spacing: 9) {
-                        Image(systemName: item.symbol)
-                            .foregroundStyle(item.tint)
-                            .frame(width: 18)
-                        VStack(alignment: .leading, spacing: 2) {
-                            Text(item.name).lineLimit(1)
-                            if let detail = item.detail {
-                                Text(detail).font(.caption).foregroundStyle(.secondary).lineLimit(2)
+                HStack {
+                    Spacer()
+                    Text("Sort:")
+                        .font(.caption)
+                        .foregroundStyle(.secondary)
+                    Picker("Sort by", selection: $dashboardSort) {
+                        ForEach(DashboardSort.allCases) { sort in
+                            Text(sort.label).tag(sort.rawValue)
+                        }
+                    }
+                    .pickerStyle(.menu)
+                    .labelsHidden()
+                    .help("Sort results by name, when they were added, file size or savings")
+                }
+                List(orderedItemIDs, id: \.self) { id in
+                    if let index = itemIndexByID[id] {
+                        let item = items[index]
+                        HStack(spacing: 9) {
+                            Image(systemName: item.symbol)
+                                .foregroundStyle(item.tint)
+                                .frame(width: 18)
+                            VStack(alignment: .leading, spacing: 2) {
+                                Text(item.name).lineLimit(1)
+                                if let detail = item.detail {
+                                    Text(detail).font(.caption).foregroundStyle(.secondary).lineLimit(2)
+                                }
+                            }
+                            Spacer(minLength: 8)
+                            VStack(alignment: .trailing, spacing: 3) {
+                                Text(item.status.label)
+                                    .font(.caption)
+                                    .foregroundStyle(item.tint)
+                                if let savings = item.savingsLabel {
+                                    Text(savings)
+                                        .font(.caption2)
+                                        .foregroundStyle(item.savingsBytes.map { $0 >= 0 ? Color.green : Color.orange } ?? .secondary)
+                                }
                             }
                         }
-                        Spacer(minLength: 8)
-                        Text(item.status.label)
-                            .font(.caption)
-                            .foregroundStyle(item.tint)
+                        .padding(.vertical, 2)
                     }
-                    .padding(.vertical, 2)
                 }
                 .listStyle(.inset)
                 .frame(minHeight: 80, maxHeight: 160)
@@ -174,11 +258,25 @@ struct ContentView: View {
                 if !items.isEmpty {
                     Button("Clear List", systemImage: "xmark.circle") {
                         items.removeAll()
+                        knownPaths.removeAll()
+                        itemIndexByID.removeAll()
+                        itemIndexByPath.removeAll()
+                        orderedItemIDs.removeAll()
+                        sortGeneration += 1
+                        processedItemCount = 0
                         summaryBatchID = nil
+                        resetSummary()
                     }
                         .buttonStyle(.borderless)
                         .disabled(isBusy)
                         .help("Clear result rows. This does not change any files.")
+                }
+                if processedItemCount > 0 {
+                    Button("Clear Processed", systemImage: "checkmark.circle") {
+                        clearProcessedItems()
+                    }
+                    .buttonStyle(.borderless)
+                    .help("Remove completed, kept and skipped rows while preserving work in progress.")
                 }
             }
         }
@@ -194,22 +292,19 @@ struct ContentView: View {
                         .font(.caption.weight(.medium))
                 }
             } else if isProcessing {
-                let total = conversionItems.count
-                let finished = finishedItems.count
                 HStack {
-                    Text("Converting image \(min(finished + 1, total)) of \(total) · \(finished) complete")
+                    Text("Converting images · \(summaryFinished) of \(summaryTotal) complete")
                         .font(.caption.weight(.medium))
                     Spacer()
-                    Text("\(Int(Double(finished) / Double(max(total, 1)) * 100))%")
+                    Text("\(Int(Double(summaryFinished) / Double(max(summaryTotal, 1)) * 100))%")
                         .font(.caption.monospacedDigit())
                         .foregroundStyle(.secondary)
                 }
-                ProgressView(value: Double(finished), total: Double(max(total, 1)))
+                ProgressView(value: Double(summaryFinished), total: Double(max(summaryTotal, 1)))
                     .progressViewStyle(.linear)
-            } else if !conversionItems.isEmpty {
-                let replaced = successfulItems.count
-                let kept = conversionItems.filter { $0.status == .failed || $0.status == .kept }.count
-                Label("Complete · \(replaced) replaced · \(kept) kept", systemImage: "checkmark.circle.fill")
+            } else if summaryTotal > 0 {
+                let kept = summaryTotal - summaryReplaced
+                Label("Complete · \(summaryReplaced) replaced · \(kept) kept", systemImage: "checkmark.circle.fill")
                     .font(.caption.weight(.medium))
                     .foregroundStyle(.secondary)
             } else {
@@ -218,9 +313,9 @@ struct ContentView: View {
                     .foregroundStyle(.secondary)
             }
 
-            if !successfulItems.isEmpty {
-                let input = successfulItems.compactMap(\.inputBytes).reduce(UInt64(0), +)
-                let output = successfulItems.compactMap(\.outputBytes).reduce(UInt64(0), +)
+            if summaryReplaced > 0 {
+                let input = summaryInputBytes
+                let output = summaryOutputBytes
                 let delta = input >= output ? input - output : output - input
                 let percentage = input == 0 ? 0 : Double(delta) / Double(input) * 100
                 let percentageText = String(format: "%.1f", percentage)
@@ -236,7 +331,23 @@ struct ContentView: View {
         .padding(.horizontal, 2)
     }
 
-    private static func fileSize(_ bytes: UInt64) -> String {
+    private func sortVisibleItems() {
+        let sort = DashboardSort(rawValue: dashboardSort) ?? .name
+        sortGeneration += 1
+        let generation = sortGeneration
+        Task {
+            try? await Task.sleep(for: .milliseconds(120))
+            guard generation == sortGeneration else { return }
+            let keys = items.map { ItemSortKey(id: $0.id, name: $0.name, addedAt: $0.addedAt, size: $0.inputBytes, saving: $0.savingsBytes) }
+            let sortedIDs = await Task.detached(priority: .utility) {
+                keys.sorted { lhs, rhs in lhs.precedes(rhs, by: sort) }.map(\.id)
+            }.value
+            guard generation == sortGeneration else { return }
+            orderedItemIDs = sortedIDs
+        }
+    }
+
+    fileprivate static func fileSize(_ bytes: UInt64) -> String {
         ByteCountFormatter.string(fromByteCount: Int64(clamping: bytes), countStyle: .file)
     }
 
@@ -315,6 +426,14 @@ struct ContentView: View {
                         }
                     }
 
+                    Picker("Images at a time", selection: $maxConcurrentConversions) {
+                        Text("One (recommended)").tag(1)
+                        Text("Two").tag(2)
+                    }
+                    Text("Two conversions can finish sooner on some Macs, but use more memory. Each encoder and validator is limited to a share of the available processor threads.")
+                        .font(.caption)
+                        .foregroundStyle(.secondary)
+
                     Toggle("Use full image buffering", isOn: $fullImageBuffering)
                     Text("Passes --buffering=0 to cjxl. Uses more memory and may improve compression.")
                         .font(.caption)
@@ -387,6 +506,7 @@ struct ContentView: View {
 
     private func acceptDrop(_ providers: [NSItemProvider]) -> Bool {
         let settingsSnapshot = currentSettings
+        scansInProgress += 1
         let group = DispatchGroup()
         let lock = NSLock()
         var urls: [URL] = []
@@ -410,9 +530,19 @@ struct ContentView: View {
         }
 
         group.notify(queue: .main) {
-            Task { @MainActor in self.enqueue(urls, settings: settingsSnapshot, providerIssues: issues) }
+            Task { @MainActor in
+                self.scansInProgress = max(0, self.scansInProgress - 1)
+                self.enqueue(urls, settings: settingsSnapshot, providerIssues: issues)
+            }
         }
         return true
+    }
+
+    private func consumeAppIconDrops() {
+        let requests = dropInbox.requests
+        guard !requests.isEmpty else { return }
+        dropInbox.removeAll()
+        for request in requests { enqueue(request.urls, settings: currentSettings) }
     }
 
     private func chooseFilesOrFolders() {
@@ -431,85 +561,215 @@ struct ContentView: View {
 
     private func enqueue(_ urls: [URL], settings: ConversionSettings, providerIssues: [DiscoveryIssue] = []) {
         guard !urls.isEmpty || !providerIssues.isEmpty else { return }
-        if activeBatchID == nil {
-            activeBatchID = UUID()
-            summaryBatchID = activeBatchID
-        }
-        guard let batchID = activeBatchID else { return }
+        let proposedBatchID = UUID()
         scansInProgress += 1
         Task {
-            let discovery = await Task.detached(priority: .userInitiated) {
-                InputDiscovery.imageFiles(in: urls)
-            }.value
-            scansInProgress = max(0, scansInProgress - 1)
-            for issue in (providerIssues + discovery.issues).prefix(25) {
-                items.insert(ConversionItem(url: URL(fileURLWithPath: issue.name), settings: settings, batchID: batchID, status: .skipped, detail: issue.message), at: 0)
-            }
-            guard !discovery.files.isEmpty else {
-                if providerIssues.isEmpty && discovery.issues.isEmpty {
-                    let name = urls.first?.lastPathComponent ?? "Selection"
-                    items.insert(ConversionItem(url: URL(fileURLWithPath: name), settings: settings, batchID: batchID, status: .skipped, detail: "No supported images found. Existing JXL files and non-image files are skipped."), at: 0)
+            let stream = InputDiscovery.imageFileBatches(in: urls)
+            var discoveredAny = false
+            var sawIssue = false
+            var issueCount = 0
+            for await event in stream {
+                switch event.payload {
+                case .files(let discoveredFiles):
+                    discoveredAny = discoveredAny || !discoveredFiles.isEmpty
+                    enqueueImages(discoveredFiles, settings: settings, proposedBatchID: proposedBatchID)
+                case .issues(let issues):
+                    sawIssue = sawIssue || !issues.isEmpty
+                    issueCount += appendIssues(issues, remaining: 25 - issueCount, settings: settings, proposedBatchID: proposedBatchID)
                 }
-                closeBatchIfIdle()
-                return
+                event.acknowledge()
             }
-            enqueueImages(discovery.files, settings: settings, batchID: batchID)
+            scansInProgress = max(0, scansInProgress - 1)
+            if !providerIssues.isEmpty {
+                sawIssue = true
+                issueCount += appendIssues(providerIssues, remaining: 25 - issueCount, settings: settings, proposedBatchID: proposedBatchID)
+            }
+            if !discoveredAny {
+                if !sawIssue {
+                    let name = urls.first?.lastPathComponent ?? "Selection"
+                    _ = appendIssues([DiscoveryIssue(name: name, message: "No supported images found. Existing JXL files and non-image files are skipped.", url: urls.first)], remaining: 1, settings: settings, proposedBatchID: proposedBatchID)
+                }
+            }
+            if scansInProgress == 0 { sortVisibleItems() }
+            closeBatchIfIdle()
         }
     }
 
-    private func enqueueImages(_ urls: [URL], settings: ConversionSettings, batchID: UUID) {
-        let newURLs = urls.filter { queuedPaths.insert($0.standardizedFileURL.path).inserted }
-        for duplicate in urls where !newURLs.contains(where: { $0.standardizedFileURL.path == duplicate.standardizedFileURL.path }) {
-            items.insert(ConversionItem(url: duplicate, settings: settings, batchID: batchID, status: .skipped, detail: "Already queued in this batch."), at: 0)
+    private func ensureBatch(_ proposedBatchID: UUID, settings: ConversionSettings) -> UUID {
+        if let activeBatchID { return activeBatchID }
+        activeBatchID = proposedBatchID
+        summaryBatchID = proposedBatchID
+        batchConcurrencyLimit = settings.maxConcurrentConversions
+        resetSummary()
+        return proposedBatchID
+    }
+
+    private func appendIssues(_ issues: [DiscoveryIssue], remaining: Int, settings: ConversionSettings, proposedBatchID: UUID) -> Int {
+        let limited = Array(issues.prefix(max(0, remaining))).filter { issue in
+            guard let path = issue.url?.standardizedFileURL.path else { return true }
+            return !knownPaths.contains(path)
         }
-        let newItems = newURLs.map { ConversionItem(url: $0, settings: settings, batchID: batchID) }
-        items.insert(contentsOf: newItems, at: 0)
-        pending.append(contentsOf: newItems)
-        guard !pending.isEmpty, !isProcessing else {
-            closeBatchIfIdle()
-            return
+        guard !limited.isEmpty else { return 0 }
+        let batchID = ensureBatch(proposedBatchID, settings: settings)
+        for issue in limited {
+            let url = issue.url ?? URL(fileURLWithPath: issue.name)
+            let item = ConversionItem(url: url, settings: settings, batchID: batchID, trackedPath: issue.url?.standardizedFileURL.path, status: .skipped, detail: issue.message)
+            appendVisibleItem(item)
         }
-        isProcessing = true
-        Task {
-            while !pending.isEmpty {
-                let item = pending.removeFirst()
-                update(item.id, status: .working, detail: "Preparing image…")
+        return limited.count
+    }
+
+    private func enqueueImages(_ files: [DiscoveredImage], settings: ConversionSettings, proposedBatchID: UUID) {
+        var candidates: [(DiscoveredImage, Int?)] = []
+        for file in files {
+            let path = file.url.standardizedFileURL.path
+            guard knownPaths.insert(path).inserted else {
+                guard let index = itemIndexByPath[path] else { continue }
+                let existing = items[index]
+                guard !existing.isInFlight, existing.queuedSourceVersion != file.sourceVersion else { continue }
+                candidates.append((file, index))
+                continue
+            }
+            candidates.append((file, nil))
+        }
+        guard !candidates.isEmpty else { return }
+        let batchID = ensureBatch(proposedBatchID, settings: settings)
+        var addedItems: [ConversionItem] = []
+        for (file, existingIndex) in candidates {
+            let item = ConversionItem(url: file.url, settings: settings, batchID: batchID, queuedSourceVersion: file.sourceVersion, inputBytes: file.size)
+            if let existingIndex {
+                sortGeneration += 1
+                if items[existingIndex].isProcessed { processedItemCount = max(0, processedItemCount - 1) }
+                let oldID = items[existingIndex].id
+                itemIndexByID[oldID] = nil
+                if let orderIndex = orderedItemIDs.firstIndex(of: oldID) { orderedItemIDs[orderIndex] = item.id }
+                items[existingIndex] = item
+                itemIndexByID[item.id] = existingIndex
+                itemIndexByPath[file.url.standardizedFileURL.path] = existingIndex
+            } else {
+                appendVisibleItem(item)
+            }
+            addedItems.append(item)
+        }
+        summaryTotal += addedItems.count
+        pending.append(contentsOf: addedItems)
+        startConversions()
+    }
+
+    private func appendVisibleItem(_ item: ConversionItem) {
+        sortGeneration += 1
+        let index = items.count
+        items.append(item)
+        if item.isProcessed { processedItemCount += 1 }
+        itemIndexByID[item.id] = index
+        if let path = item.trackedPath {
+            knownPaths.insert(path)
+            itemIndexByPath[path] = index
+        }
+        orderedItemIDs.append(item.id)
+    }
+
+    private func startConversions() {
+        let limit = batchConcurrencyLimit
+        while activeConversionCount < limit && nextPendingIndex < pending.count {
+            let item = pending[nextPendingIndex]
+            nextPendingIndex += 1
+            activeConversionCount += 1
+            update(item.id, status: .working, detail: "Preparing image…")
+            Task {
                 do {
                     let result = try await Task.detached(priority: .userInitiated) {
                         try JXLConverter.convert(item.url, settings: item.settings, queuedSourceVersion: item.queuedSourceVersion)
                     }.value
-                    update(item.id, status: result.status, detail: result.message, inputBytes: result.inputBytes, outputBytes: result.outputBytes)
+                    complete(item.id, result: result)
                 } catch {
-                    update(item.id, status: .failed, detail: error.localizedDescription)
+                    complete(item.id, error: error)
                 }
-                queuedPaths.remove(item.url.standardizedFileURL.path)
+                activeConversionCount = max(0, activeConversionCount - 1)
+                if nextPendingIndex == pending.count {
+                    pending.removeAll(keepingCapacity: true)
+                    nextPendingIndex = 0
+                }
+                startConversions()
+                closeBatchIfIdle()
             }
-            isProcessing = false
-            closeBatchIfIdle()
         }
     }
 
     private func closeBatchIfIdle() {
-        if scansInProgress == 0 && !isProcessing && pending.isEmpty {
+        if scansInProgress == 0 && activeConversionCount == 0 && nextPendingIndex >= pending.count {
             activeBatchID = nil
         }
     }
 
     private func update(_ id: UUID, status: ItemStatus, detail: String?, inputBytes: UInt64? = nil, outputBytes: UInt64? = nil) {
-        guard let index = items.firstIndex(where: { $0.id == id }) else { return }
+        guard let index = itemIndexByID[id] else { return }
+        let wasProcessed = items[index].isProcessed
         items[index].status = status
         items[index].detail = detail
         if let inputBytes { items[index].inputBytes = inputBytes }
         items[index].outputBytes = outputBytes
+        if !wasProcessed && items[index].isProcessed { processedItemCount += 1 }
+        if wasProcessed && !items[index].isProcessed { processedItemCount = max(0, processedItemCount - 1) }
+        if !wasProcessed && items[index].isProcessed { summaryFinished += 1 }
+    }
+
+    private func complete(_ id: UUID, result: ConversionResult) {
+        update(id, status: result.status, detail: result.message, inputBytes: result.inputBytes, outputBytes: result.outputBytes)
+        if result.status == .done, let outputBytes = result.outputBytes {
+            summaryReplaced += 1
+            summaryInputBytes += result.inputBytes
+            summaryOutputBytes += outputBytes
+        }
+        if dashboardSort == DashboardSort.saving.rawValue { sortVisibleItems() }
+    }
+
+    private func complete(_ id: UUID, error: Error) {
+        update(id, status: .failed, detail: error.localizedDescription)
+        if dashboardSort == DashboardSort.saving.rawValue { sortVisibleItems() }
+    }
+
+    private func resetSummary() {
+        summaryTotal = 0
+        summaryFinished = 0
+        summaryReplaced = 0
+        summaryInputBytes = 0
+        summaryOutputBytes = 0
+    }
+
+    private func clearProcessedItems() {
+        items.removeAll(where: \.isProcessed)
+        processedItemCount = 0
+        rebuildItemIndexes()
+        sortVisibleItems()
+    }
+
+    private func rebuildItemIndexes() {
+        itemIndexByID.removeAll(keepingCapacity: true)
+        itemIndexByPath.removeAll(keepingCapacity: true)
+        knownPaths.removeAll(keepingCapacity: true)
+        orderedItemIDs.removeAll(keepingCapacity: true)
+        for (index, item) in items.enumerated() {
+            itemIndexByID[item.id] = index
+            if item.isProcessed { processedItemCount += 1 }
+            if let path = item.trackedPath {
+                knownPaths.insert(path)
+                itemIndexByPath[path] = index
+            }
+            orderedItemIDs.append(item.id)
+        }
     }
 
     private var currentSettings: ConversionSettings {
-        ConversionSettings(
+        let concurrencyLimit = min(2, max(1, maxConcurrentConversions))
+        return ConversionSettings(
             lossy: lossy,
             quality: quality,
             transparencyLossy: transparencyLossy && lossy && quality < 100,
             transparencyQuality: transparencyQuality,
             effort: (SpeedPreset(rawValue: speed) ?? .medium).effort,
+            maxConcurrentConversions: concurrencyLimit,
+            workerThreads: max(1, ProcessInfo.processInfo.activeProcessorCount / concurrencyLimit),
             fullImageBuffering: fullImageBuffering,
             keepOriginalIfJXLNotSmaller: keepOriginalIfJXLNotSmaller,
             includeExif: includeExif,
@@ -525,20 +785,39 @@ private struct ConversionItem: Identifiable {
     let settings: ConversionSettings
     let batchID: UUID?
     let queuedSourceVersion: SourceVersion?
+    let trackedPath: String?
+    let addedAt: Date
     var inputBytes: UInt64?
     var outputBytes: UInt64?
     var status: ItemStatus = .queued
     var detail: String? = "Waiting"
-    init(url: URL, settings: ConversionSettings, batchID: UUID? = nil, status: ItemStatus = .queued, detail: String? = "Waiting") {
+    init(url: URL, settings: ConversionSettings, batchID: UUID? = nil, queuedSourceVersion: SourceVersion? = nil, inputBytes: UInt64? = nil, trackedPath: String? = nil, status: ItemStatus = .queued, detail: String? = "Waiting") {
         self.url = url
         self.settings = settings
         self.batchID = batchID
-        self.queuedSourceVersion = try? SourceVersion.capture(url)
+        self.queuedSourceVersion = queuedSourceVersion
+        self.trackedPath = trackedPath ?? (status == .queued ? url.standardizedFileURL.path : nil)
+        self.addedAt = Date()
         self.status = status
         self.detail = detail
-        self.inputBytes = (try? url.resourceValues(forKeys: [.fileSizeKey]).fileSize).map { UInt64(max(0, $0)) }
+        self.inputBytes = inputBytes
     }
     var name: String { url.lastPathComponent }
+    var isProcessed: Bool { status == .done || status == .failed || status == .kept || status == .skipped }
+    var isInFlight: Bool { status == .queued || status == .working }
+    var savingsBytes: Int64? {
+        guard status == .done, let inputBytes, let outputBytes else { return nil }
+        if inputBytes >= outputBytes { return Int64(clamping: inputBytes - outputBytes) }
+        return -Int64(clamping: outputBytes - inputBytes)
+    }
+    var savingsLabel: String? {
+        guard let savingsBytes, let inputBytes, inputBytes > 0 else { return nil }
+        let amount = UInt64(savingsBytes.magnitude)
+        let percentage = Double(amount) / Double(inputBytes) * 100
+        let value = String(format: "%.1f", percentage)
+        let amountText = ByteCountFormatter.string(fromByteCount: Int64(clamping: amount), countStyle: .file)
+        return savingsBytes >= 0 ? "Saved \(amountText) (\(value)%)" : "Larger by \(amountText) (\(value)%)"
+    }
     var symbol: String {
         switch status {
         case .queued: "clock"
@@ -561,12 +840,59 @@ private struct ConversionItem: Identifiable {
     }
 }
 
+private enum DashboardSort: String, CaseIterable, Identifiable, Sendable {
+    case name, added, size, saving
+    var id: String { rawValue }
+    var label: String {
+        switch self {
+        case .name: "Name"
+        case .added: "Added"
+        case .size: "Size"
+        case .saving: "Saving"
+        }
+    }
+}
+
+private struct ItemSortKey: Sendable {
+    let id: UUID
+    let name: String
+    let addedAt: Date
+    let size: UInt64?
+    let saving: Int64?
+
+    func precedes(_ other: ItemSortKey, by sort: DashboardSort) -> Bool {
+        switch sort {
+        case .name:
+            let comparison = name.localizedStandardCompare(other.name)
+            return comparison == .orderedSame ? addedAt > other.addedAt : comparison == .orderedAscending
+        case .added:
+            return addedAt > other.addedAt
+        case .size:
+            switch (size, other.size) {
+            case let (left?, right?): return left == right ? addedAt > other.addedAt : left > right
+            case (_?, nil): return true
+            case (nil, _?): return false
+            case (nil, nil): return addedAt > other.addedAt
+            }
+        case .saving:
+            switch (saving, other.saving) {
+            case let (left?, right?): return left == right ? addedAt > other.addedAt : left > right
+            case (_?, nil): return true
+            case (nil, _?): return false
+            case (nil, nil): return addedAt > other.addedAt
+            }
+        }
+    }
+}
+
 private struct ConversionSettings: Sendable {
     let lossy: Bool
     let quality: Int
     let transparencyLossy: Bool
     let transparencyQuality: Int
     let effort: Int
+    let maxConcurrentConversions: Int
+    let workerThreads: Int
     let fullImageBuffering: Bool
     let keepOriginalIfJXLNotSmaller: Bool
     let includeExif: Bool
@@ -680,7 +1006,7 @@ private enum JXLConverter {
 
         let encoded = source.deletingLastPathComponent().appendingPathComponent(".jxl-drop-\(UUID().uuidString).jxl")
         defer { try? FileManager.default.removeItem(at: encoded) }
-        var arguments = ["--quiet", "-e", String(settings.effort)]
+        var arguments = ["--quiet", "--num_threads=\(settings.workerThreads)", "-e", String(settings.effort)]
         if settings.fullImageBuffering { arguments += ["--buffering=0"] }
         if settings.lossy {
             arguments += ["-j", "0", "-q", String(settings.libjxlQuality)]
@@ -704,7 +1030,7 @@ private enum JXLConverter {
         }
 
         let decoded = work.appendingPathComponent("validation.png")
-        let validation = try run(djxl, [encoded.path, decoded.path])
+        let validation = try run(djxl, ["--num_threads=\(settings.workerThreads)", encoded.path, decoded.path])
         guard validation.status == 0, FileManager.default.fileExists(atPath: decoded.path) else {
             throw ConversionError("The new JXL did not pass a decode check. The original was kept. \(validation.message)")
         }
@@ -811,7 +1137,7 @@ private enum JXLConverter {
 
             // Copy to a hidden staging file, then atomically publish without replacing.
             let staging = directory.appendingPathComponent(".jxl-drop-publish-\(UUID().uuidString).tmp")
-            let destinationFD = open(staging.path, O_WRONLY | O_CREAT | O_EXCL, mode_t(0o666))
+            var destinationFD = open(staging.path, O_WRONLY | O_CREAT | O_EXCL, mode_t(0o666))
             if destinationFD < 0 {
                 if errno == EEXIST {
                     suffix += 1
@@ -821,6 +1147,11 @@ private enum JXLConverter {
             }
             do {
                 try copyFileContents(from: encoded, to: destinationFD)
+                guard close(destinationFD) == 0 else {
+                    destinationFD = -1
+                    throw ConversionError("Could not close the JXL output: \(String(cString: strerror(errno)))")
+                }
+                destinationFD = -1
                 guard try isJXL(staging) else {
                     throw ConversionError("The copied JXL output did not pass its file check. The original was kept.")
                 }
@@ -835,7 +1166,7 @@ private enum JXLConverter {
                 }
                 return candidate
             } catch {
-                _ = close(destinationFD)
+                if destinationFD >= 0 { _ = close(destinationFD) }
                 _ = unlink(staging.path)
                 throw error
             }
@@ -861,9 +1192,6 @@ private enum JXLConverter {
         }
         guard fsync(destinationFD) == 0 else {
             throw ConversionError("Could not finish writing the JXL output: \(String(cString: strerror(errno)))")
-        }
-        guard close(destinationFD) == 0 else {
-            throw ConversionError("Could not close the JXL output: \(String(cString: strerror(errno)))")
         }
     }
 
@@ -945,6 +1273,7 @@ private enum JXLConverter {
         let pipe = Pipe()
         process.executableURL = executable
         process.arguments = arguments
+        process.qualityOfService = .userInitiated
         process.standardOutput = pipe
         process.standardError = pipe
         try process.run()
@@ -991,7 +1320,7 @@ private enum ImageFormats {
     static let supported = direct.union(singleFrameStaging)
 }
 
-private struct SourceVersion: Equatable {
+private struct SourceVersion: Equatable, Sendable {
     let device: UInt64
     let fileNumber: UInt64
     let size: UInt64
@@ -1011,63 +1340,127 @@ private struct SourceVersion: Equatable {
 }
 
 private enum InputDiscovery {
-    static func imageFiles(in roots: [URL]) -> DiscoveryResult {
-        var result = DiscoveryResult()
+    static func imageFileBatches(in roots: [URL]) -> AsyncStream<DiscoveryEvent> {
+        AsyncStream { continuation in
+            Task.detached(priority: .utility) {
+                InputDiscovery.scan(in: roots) { payload in
+                    let event = DiscoveryEvent(payload: payload)
+                    continuation.yield(event)
+                    event.waitForAcknowledgement()
+                }
+                continuation.finish()
+            }
+        }
+    }
+
+    private static func scan(in roots: [URL], yield: (DiscoveryPayload) -> Void) {
         var seen = Set<String>()
+        var files: [DiscoveredImage] = []
+        var issues: [DiscoveryIssue] = []
         let fileManager = FileManager.default
         let options: FileManager.DirectoryEnumerationOptions = [.skipsHiddenFiles, .skipsPackageDescendants]
+
+        func recordIssue(_ issue: DiscoveryIssue) {
+            if issues.count < 25 { issues.append(issue) }
+        }
+
+        func flushFiles() {
+            guard !files.isEmpty else { return }
+            yield(.files(files))
+            files.removeAll(keepingCapacity: true)
+        }
 
         func addIfImage(_ url: URL) {
             let normalized = url.standardizedFileURL
             let ext = normalized.pathExtension.lowercased()
-            guard ext != "jxl", ImageFormats.supported.contains(ext),
-                  let values = try? normalized.resourceValues(forKeys: [.isRegularFileKey]),
-                  values.isRegularFile == true,
-                  seen.insert(normalized.path).inserted else { return }
-            result.files.append(normalized)
+            guard ext != "jxl", ImageFormats.supported.contains(ext), seen.insert(normalized.path).inserted,
+                  let values = try? normalized.resourceValues(forKeys: [.isRegularFileKey, .fileSizeKey]),
+                  values.isRegularFile == true else { return }
+            if ext == "gif", let source = CGImageSourceCreateWithURL(normalized as CFURL, nil), CGImageSourceGetCount(source) > 1 {
+                recordIssue(DiscoveryIssue(name: normalized.lastPathComponent, message: "Animated GIF skipped. JPEG XL supports animation, but this app safely replaces single-frame images only.", url: normalized))
+                return
+            }
+            let sourceVersion = try? SourceVersion.capture(normalized)
+            let size = sourceVersion?.size ?? values.fileSize.map { UInt64(max(0, $0)) }
+            files.append(DiscoveredImage(url: normalized, sourceVersion: sourceVersion, size: size))
+            if files.count >= 64 { flushFiles() }
         }
 
+        var visitedRoots = 0
         for root in roots {
+            visitedRoots += 1
             guard let values = try? root.resourceValues(forKeys: [.isDirectoryKey, .isRegularFileKey, .isPackageKey]) else {
-                result.issues.append(DiscoveryIssue(name: root.lastPathComponent, message: "Cannot read this item or its permissions."))
+                recordIssue(DiscoveryIssue(name: root.lastPathComponent, message: "Cannot read this item or its permissions.", url: root))
                 continue
             }
             if values.isPackage == true {
-                result.issues.append(DiscoveryIssue(name: root.lastPathComponent, message: "Packages are skipped; drop a folder containing image files instead."))
+                recordIssue(DiscoveryIssue(name: root.lastPathComponent, message: "Packages are skipped; drop a folder containing image files instead.", url: root))
                 continue
             }
             if values.isDirectory == true {
-                guard let enumerator = fileManager.enumerator(at: root, includingPropertiesForKeys: [.isRegularFileKey, .isPackageKey], options: options, errorHandler: { failedURL, error in
-                    result.issues.append(DiscoveryIssue(name: failedURL.lastPathComponent, message: "Could not scan this folder: \(error.localizedDescription)"))
+                guard let enumerator = fileManager.enumerator(at: root, includingPropertiesForKeys: [.isRegularFileKey, .isPackageKey, .fileSizeKey], options: options, errorHandler: { failedURL, error in
+                    recordIssue(DiscoveryIssue(name: failedURL.lastPathComponent, message: "Could not scan this folder: \(error.localizedDescription)", url: failedURL))
                     return true
                 }) else {
-                    result.issues.append(DiscoveryIssue(name: root.lastPathComponent, message: "Could not scan this folder."))
+                    recordIssue(DiscoveryIssue(name: root.lastPathComponent, message: "Could not scan this folder.", url: root))
                     continue
                 }
-                for case let url as URL in enumerator { addIfImage(url) }
+                var visited = 0
+                for case let url as URL in enumerator {
+                    visited += 1
+                    addIfImage(url)
+                    if visited.isMultiple(of: 128) { flushFiles() }
+                }
             } else if values.isRegularFile == true {
-                let before = result.files.count
-                let wasDiscoveredThroughFolder = seen.contains(root.standardizedFileURL.path)
+                let wasSeen = seen.contains(root.standardizedFileURL.path)
                 addIfImage(root)
-                if result.files.count == before && !wasDiscoveredThroughFolder && root.pathExtension.lowercased() != "jxl" {
-                    result.issues.append(DiscoveryIssue(name: root.lastPathComponent, message: "Unsupported image format or not a readable image."))
+                if !wasSeen && !seen.contains(root.standardizedFileURL.path) && root.pathExtension.lowercased() != "jxl" {
+                    recordIssue(DiscoveryIssue(name: root.lastPathComponent, message: "Unsupported image format or not a readable image.", url: root))
                 }
             } else {
-                result.issues.append(DiscoveryIssue(name: root.lastPathComponent, message: "Only image files and folders can be added."))
+                recordIssue(DiscoveryIssue(name: root.lastPathComponent, message: "Only image files and folders can be added.", url: root))
             }
+            if visitedRoots.isMultiple(of: 64) { flushFiles() }
         }
-        return result
+        flushFiles()
+        if !issues.isEmpty { yield(.issues(issues)) }
     }
 }
 
-private struct DiscoveryResult {
-    var files: [URL] = []
-    var issues: [DiscoveryIssue] = []
+private enum DiscoveryPayload: Sendable {
+    case files([DiscoveredImage])
+    case issues([DiscoveryIssue])
+}
+
+private final class DiscoveryAcknowledgement: @unchecked Sendable {
+    private let semaphore = DispatchSemaphore(value: 0)
+    func signal() { semaphore.signal() }
+    func wait() { semaphore.wait() }
+}
+
+private struct DiscoveryEvent: Sendable {
+    let payload: DiscoveryPayload
+    private let acknowledgement = DiscoveryAcknowledgement()
+    func acknowledge() { acknowledgement.signal() }
+    func waitForAcknowledgement() { acknowledgement.wait() }
+}
+
+private struct DiscoveredImage: Sendable {
+    let url: URL
+    let sourceVersion: SourceVersion?
+    let size: UInt64?
 }
 
 private struct DiscoveryIssue: Sendable {
     let name: String
     let message: String
+    let url: URL?
+
+    init(name: String, message: String, url: URL? = nil) {
+        self.name = name
+        self.message = message
+        self.url = url
+    }
 }
 
 private struct ConversionError: LocalizedError {

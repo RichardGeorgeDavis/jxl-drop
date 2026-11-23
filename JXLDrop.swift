@@ -118,14 +118,18 @@ struct ContentView: View {
     private let resultsPerPage = 100
     private var isProcessing: Bool { activeConversionCount > 0 || nextPendingIndex < pending.count }
     private var isBusy: Bool { isProcessing || scansInProgress > 0 }
+    private var resultPageCount: Int { max(1, (orderedItemIDs.count + resultsPerPage - 1) / resultsPerPage) }
+    private var currentResultPage: Int { min(max(0, resultPage), resultPageCount - 1) }
+    private var currentResultRange: Range<Int> {
+        let start = min(currentResultPage * resultsPerPage, orderedItemIDs.count)
+        return start..<min(start + resultsPerPage, orderedItemIDs.count)
+    }
     private var colourIsEffectivelyLossless: Bool { !lossy || quality >= 100 }
     private var transparencyIsEffectivelyLossless: Bool {
         colourIsEffectivelyLossless || !transparencyLossy || transparencyQuality >= 100
     }
     private var visibleItemIDs: [UUID] {
-        let start = min(resultPage * resultsPerPage, orderedItemIDs.count)
-        let end = min(start + resultsPerPage, orderedItemIDs.count)
-        return Array(orderedItemIDs[start..<end])
+        Array(orderedItemIDs[currentResultRange])
     }
 
     var body: some View {
@@ -256,28 +260,28 @@ struct ContentView: View {
                 .frame(minHeight: 80, maxHeight: 160)
 
                 HStack(spacing: 8) {
-                    Text("Showing \(resultPage * resultsPerPage + 1)–\(min((resultPage + 1) * resultsPerPage, orderedItemIDs.count)) of \(orderedItemIDs.count)")
+                    Text("Showing \(orderedItemIDs.isEmpty ? 0 : currentResultRange.lowerBound + 1)–\(currentResultRange.upperBound) of \(orderedItemIDs.count)")
                         .font(.caption2)
                         .foregroundStyle(.secondary)
                     Spacer()
                     Button {
-                        resultPage = max(0, resultPage - 1)
+                        resultPage = max(0, currentResultPage - 1)
                     } label: {
                         Image(systemName: "chevron.left")
                     }
                     .buttonStyle(.borderless)
-                    .disabled(resultPage == 0)
+                    .disabled(currentResultPage == 0)
                     .help("Previous 100 results")
-                    Text("\(resultPage + 1) / \(max(1, (orderedItemIDs.count + resultsPerPage - 1) / resultsPerPage))")
+                    Text("\(currentResultPage + 1) / \(resultPageCount)")
                         .font(.caption2.monospacedDigit())
                         .foregroundStyle(.secondary)
                     Button {
-                        resultPage += 1
+                        resultPage = min(currentResultPage + 1, resultPageCount - 1)
                     } label: {
                         Image(systemName: "chevron.right")
                     }
                     .buttonStyle(.borderless)
-                    .disabled((resultPage + 1) * resultsPerPage >= orderedItemIDs.count)
+                    .disabled(currentResultPage + 1 >= resultPageCount)
                     .help("Next 100 results")
                 }
             }
@@ -381,8 +385,7 @@ struct ContentView: View {
             }.value
             guard generation == sortGeneration else { return }
             orderedItemIDs = sortedIDs
-            let pageCount = max(1, (sortedIDs.count + resultsPerPage - 1) / resultsPerPage)
-            resultPage = min(resultPage, pageCount - 1)
+            clampResultPage()
         }
     }
 
@@ -730,6 +733,12 @@ struct ContentView: View {
                     nextPendingIndex = 0
                 }
                 startConversions()
+                if dashboardSort == DashboardSort.saving.rawValue,
+                   scansInProgress == 0,
+                   activeConversionCount == 0,
+                   nextPendingIndex >= pending.count {
+                    sortVisibleItems()
+                }
                 closeBatchIfIdle()
             }
         }
@@ -760,12 +769,10 @@ struct ContentView: View {
             summaryInputBytes += result.inputBytes
             summaryOutputBytes += outputBytes
         }
-        if dashboardSort == DashboardSort.saving.rawValue { sortVisibleItems() }
     }
 
     private func complete(_ id: UUID, error: Error) {
         update(id, status: .failed, detail: error.localizedDescription)
-        if dashboardSort == DashboardSort.saving.rawValue { sortVisibleItems() }
     }
 
     private func resetSummary() {
@@ -780,7 +787,12 @@ struct ContentView: View {
         items.removeAll(where: \.isProcessed)
         processedItemCount = 0
         rebuildItemIndexes()
+        clampResultPage()
         sortVisibleItems()
+    }
+
+    private func clampResultPage() {
+        resultPage = min(max(0, resultPage), resultPageCount - 1)
     }
 
     private func rebuildItemIndexes() {

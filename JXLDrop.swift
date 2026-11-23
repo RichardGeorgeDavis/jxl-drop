@@ -86,6 +86,7 @@ struct ContentView: View {
     @State private var itemIndexByID: [UUID: Int] = [:]
     @State private var itemIndexByPath: [String: Int] = [:]
     @State private var orderedItemIDs: [UUID] = []
+    @State private var resultPage = 0
     @State private var sortGeneration = 0
     @State private var activeBatchID: UUID?
     @State private var summaryBatchID: UUID?
@@ -114,11 +115,17 @@ struct ContentView: View {
     @AppStorage("jxl.includeXmp") private var includeXmp = false
     @AppStorage("jxl.includePhotoshopExtras") private var includePhotoshopExtras = false
 
+    private let resultsPerPage = 100
     private var isProcessing: Bool { activeConversionCount > 0 || nextPendingIndex < pending.count }
     private var isBusy: Bool { isProcessing || scansInProgress > 0 }
     private var colourIsEffectivelyLossless: Bool { !lossy || quality >= 100 }
     private var transparencyIsEffectivelyLossless: Bool {
         colourIsEffectivelyLossless || !transparencyLossy || transparencyQuality >= 100
+    }
+    private var visibleItemIDs: [UUID] {
+        let start = min(resultPage * resultsPerPage, orderedItemIDs.count)
+        let end = min(start + resultsPerPage, orderedItemIDs.count)
+        return Array(orderedItemIDs[start..<end])
     }
 
     var body: some View {
@@ -135,7 +142,10 @@ struct ContentView: View {
         .frame(minWidth: settingsPanelVisible ? 850 : 520, minHeight: 560)
         .contentShape(Rectangle())
         .onDrop(of: [UTType.fileURL.identifier], isTargeted: $isTargeted, perform: acceptDrop)
-        .onChange(of: dashboardSort) { _ in sortVisibleItems() }
+        .onChange(of: dashboardSort) { _ in
+            resultPage = 0
+            sortVisibleItems()
+        }
         .onChange(of: dropInbox.requests.count) { _ in consumeAppIconDrops() }
         .onAppear { consumeAppIconDrops() }
     }
@@ -214,7 +224,7 @@ struct ContentView: View {
                     .labelsHidden()
                     .help("Sort results by name, when they were added, file size or savings")
                 }
-                List(orderedItemIDs, id: \.self) { id in
+                List(visibleItemIDs, id: \.self) { id in
                     if let index = itemIndexByID[id] {
                         let item = items[index]
                         HStack(spacing: 9) {
@@ -244,6 +254,32 @@ struct ContentView: View {
                 }
                 .listStyle(.inset)
                 .frame(minHeight: 80, maxHeight: 160)
+
+                HStack(spacing: 8) {
+                    Text("Showing \(resultPage * resultsPerPage + 1)–\(min((resultPage + 1) * resultsPerPage, orderedItemIDs.count)) of \(orderedItemIDs.count)")
+                        .font(.caption2)
+                        .foregroundStyle(.secondary)
+                    Spacer()
+                    Button {
+                        resultPage = max(0, resultPage - 1)
+                    } label: {
+                        Image(systemName: "chevron.left")
+                    }
+                    .buttonStyle(.borderless)
+                    .disabled(resultPage == 0)
+                    .help("Previous 100 results")
+                    Text("\(resultPage + 1) / \(max(1, (orderedItemIDs.count + resultsPerPage - 1) / resultsPerPage))")
+                        .font(.caption2.monospacedDigit())
+                        .foregroundStyle(.secondary)
+                    Button {
+                        resultPage += 1
+                    } label: {
+                        Image(systemName: "chevron.right")
+                    }
+                    .buttonStyle(.borderless)
+                    .disabled((resultPage + 1) * resultsPerPage >= orderedItemIDs.count)
+                    .help("Next 100 results")
+                }
             }
 
             if !items.isEmpty || isBusy {
@@ -262,6 +298,7 @@ struct ContentView: View {
                         itemIndexByID.removeAll()
                         itemIndexByPath.removeAll()
                         orderedItemIDs.removeAll()
+                        resultPage = 0
                         sortGeneration += 1
                         processedItemCount = 0
                         summaryBatchID = nil
@@ -344,6 +381,8 @@ struct ContentView: View {
             }.value
             guard generation == sortGeneration else { return }
             orderedItemIDs = sortedIDs
+            let pageCount = max(1, (sortedIDs.count + resultsPerPage - 1) / resultsPerPage)
+            resultPage = min(resultPage, pageCount - 1)
         }
     }
 
